@@ -1940,3 +1940,72 @@ class TestKGModels(TestCase):
         b = KGNode.objects.create(node_type="author", key="A1")
         e = KGEdge.objects.create(source=a, target=b, edge_type="AUTHORED_BY")
         self.assertEqual((e.weight, e.provenance, e.properties), (1.0, "openalex", {}))
+
+
+class TestOpenAlexGraphQueries(TestCase):
+    """Bulk-by-ID, citing-works and by-DOI lookups used by the knowledge graph."""
+
+    @staticmethod
+    def _chain(mock_works, results=None):
+        """Works() returns a query whose filter/filter_or/sort/select return itself."""
+        query = Mock()
+        for name in ("filter", "filter_or", "sort", "select"):
+            getattr(query, name).return_value = query
+        query.get.return_value = results if results is not None else []
+        mock_works.return_value = query
+        return query
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_get_works_by_ids_batches_by_50(self, mock_works):
+        query = self._chain(mock_works)
+        ids = [f"W{i}" for i in range(120)]
+        OpenAlexService().get_works_by_ids(ids)
+        self.assertEqual(query.get.call_count, 3)
+        sizes = [c.kwargs["openalex_id"] for c in query.filter_or.call_args_list]
+        self.assertEqual([len(s) for s in sizes], [50, 50, 20])
+        self.assertEqual(
+            [c.kwargs["per_page"] for c in query.get.call_args_list], [50, 50, 20]
+        )
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_get_works_by_ids_empty_makes_no_call(self, mock_works):
+        self.assertEqual(OpenAlexService().get_works_by_ids([]), [])
+        mock_works.assert_not_called()
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_get_works_by_ids_fields_override(self, mock_works):
+        query = self._chain(mock_works, [{"id": "W1"}])
+        result = OpenAlexService().get_works_by_ids(
+            ["W1"], fields=["id", "related_works"]
+        )
+        query.select.assert_called_once_with(["id", "related_works"])
+        self.assertEqual(result, [{"id": "W1"}])
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_get_citing_works_uses_cites_filter(self, mock_works):
+        query = self._chain(mock_works, [{"id": "W9"}])
+        result = OpenAlexService().get_citing_works(["W1", "W2"], limit=5)
+        query.filter.assert_called_once_with(cites="W1|W2")
+        query.sort.assert_called_once_with(cited_by_count="desc")
+        query.get.assert_called_once_with(per_page=5)
+        self.assertEqual(result, [{"id": "W9"}])
+
+    @patch("Research_AI_Assistant.services.openalex_service.time.sleep")
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_get_citing_works_wraps_errors(self, mock_works, mock_sleep):
+        import requests as req_lib
+
+        query = self._chain(mock_works)
+        response = Mock(status_code=503)
+        query.get.side_effect = req_lib.exceptions.HTTPError(response=response)
+        with self.assertRaises(OpenAlexAPIError):
+            OpenAlexService().get_citing_works(["W1"])
+        self.assertEqual(query.get.call_count, 3)
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_get_works_by_dois_normalises(self, mock_works):
+        query = self._chain(mock_works, [{"id": "W1"}])
+        OpenAlexService().get_works_by_dois(
+            ["https://doi.org/10.1000/ABC", "10.2000/Def"]
+        )
+        query.filter_or.assert_called_once_with(doi=["10.1000/abc", "10.2000/def"])

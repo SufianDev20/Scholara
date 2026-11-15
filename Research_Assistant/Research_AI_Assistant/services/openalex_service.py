@@ -43,6 +43,27 @@ RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
 MAX_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 1.0
 
+# Knowledge-graph lookups. IDs are sent short (W123), about 600 characters of
+# URL per 50; pyalex allows 100 items and the URL limit is 4096 characters.
+# pyalex 0.21 (pyalex/api.py) sets no request timeout, so a hung OpenAlex call
+# cannot be interrupted: the build deadline only works between calls.
+ID_BATCH = 50
+KG_WORK_FIELDS = [
+    "id",
+    "doi",
+    "title",
+    "publication_year",
+    "type",
+    "cited_by_count",
+    "fwci",
+    "referenced_works",
+    "authorships",
+    "topics",
+    "primary_topic",
+    "keywords",
+    "primary_location",
+]
+
 
 def _response_detail(exc) -> str:
     """OpenAlex's own explanation (e.g. "API key required for cursor paging")."""
@@ -384,4 +405,56 @@ class OpenAlexService:
             )
             raise OpenAlexAPIError(
                 f"Failed to retrieve authors from OpenAlex: {str(e)}"
+            ) from e
+
+    def _fetch_batches(self, filter_name: str, values: List[str], fields: List[str]):
+        """Fetch works whose `filter_name` is any of `values`, ID_BATCH at a time."""
+        works: List[Dict] = []
+        try:
+            for i in range(0, len(values), ID_BATCH):
+                batch = values[i : i + ID_BATCH]
+                query = Works().filter_or(**{filter_name: batch}).select(fields)
+                works.extend(_get_with_retry(query, per_page=len(batch)))
+            return works
+        except Exception as e:
+            logger.error("OpenAlex lookup by %s failed", filter_name, exc_info=True)
+            raise OpenAlexAPIError(
+                f"Failed to retrieve works from OpenAlex: {str(e)}"
+                f"{_response_detail(e)}"
+            ) from e
+
+    def get_works_by_ids(
+        self, ids: List[str], fields: Optional[List[str]] = None
+    ) -> List[Dict]:
+        """Raw works for short or full OpenAlex IDs; IDs not found are absent."""
+        if not ids:
+            return []
+        return self._fetch_batches("openalex_id", list(ids), fields or KG_WORK_FIELDS)
+
+    def get_works_by_dois(self, dois: List[str]) -> List[Dict]:
+        """Raw works for DOIs (lower-cased, https://doi.org/ prefix removed)."""
+        if not dois:
+            return []
+        cleaned = [
+            d.strip().lower().removeprefix("https://doi.org/") for d in dois if d
+        ]
+        return self._fetch_batches("doi", cleaned, KG_WORK_FIELDS) if cleaned else []
+
+    def get_citing_works(self, ids: List[str], limit: int = 50) -> List[Dict]:
+        """Works citing any of `ids`, most cited first, at most `limit`."""
+        if not ids:
+            return []
+        try:
+            query = (
+                Works()
+                .filter(cites="|".join(ids))
+                .sort(cited_by_count="desc")
+                .select(KG_WORK_FIELDS)
+            )
+            return list(_get_with_retry(query, per_page=min(limit, 200)))[:limit]
+        except Exception as e:
+            logger.error("OpenAlex citing-works lookup failed", exc_info=True)
+            raise OpenAlexAPIError(
+                f"Failed to retrieve citing works from OpenAlex: {str(e)}"
+                f"{_response_detail(e)}"
             ) from e
