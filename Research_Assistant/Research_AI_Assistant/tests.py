@@ -11,6 +11,7 @@ Covers:
 """
 
 import json
+from collections import Counter
 from datetime import timedelta
 from unittest.mock import MagicMock, Mock, patch
 
@@ -35,6 +36,7 @@ from .services.performance_tracker import (
 )
 
 from .services.openalex_service import OpenAlexService, OpenAlexAPIError
+from .services.kg_mapper import EDGE_VOCAB, short_id, work_to_graph
 from .services.extract_service import ExtractionService
 from django.core.cache import cache
 
@@ -2009,3 +2011,146 @@ class TestOpenAlexGraphQueries(TestCase):
             ["https://doi.org/10.1000/ABC", "10.2000/Def"]
         )
         query.filter_or.assert_called_once_with(doi=["10.1000/abc", "10.2000/def"])
+
+
+OA = "https://openalex.org/"
+
+FULL_WORK = {
+    "id": OA + "W1",
+    "doi": "https://doi.org/10.1000/x",
+    "title": "Linked data",
+    "publication_year": 2020,
+    "type": "article",
+    "cited_by_count": 7,
+    "fwci": 1.5,
+    "referenced_works": [OA + "W10", OA + "W11", OA + "W12"],
+    "authorships": [
+        {
+            "author_position": "first",
+            "is_corresponding": True,
+            "author": {"id": OA + "A1", "display_name": "Ada", "orcid": "https://orcid.org/0000-0001"},
+            "institutions": [
+                {"id": OA + "I1", "display_name": "Uni One", "country_code": "GB",
+                 "ror": "https://ror.org/1", "type": "education"}
+            ],
+        },
+        {
+            "author_position": "last",
+            "is_corresponding": False,
+            "author": {"id": OA + "A2", "display_name": "Bob", "orcid": None},
+            "institutions": [],
+        },
+    ],
+    "primary_location": {
+        "source": {"id": OA + "S1", "display_name": "Journal One", "issn_l": "1234-5678", "type": "journal"}
+    },
+    "primary_topic": {"id": OA + "T2"},
+    "topics": [
+        {"id": OA + "T1", "display_name": "Topic One", "score": 0.9,
+         "subfield": {"display_name": "SF"}, "field": {"display_name": "F"}, "domain": {"display_name": "D"}},
+        {"id": OA + "T2", "display_name": "Topic Two", "score": 0.5,
+         "subfield": {"display_name": "SF2"}, "field": {"display_name": "F2"}, "domain": {"display_name": "D2"}},
+    ],
+    "keywords": [
+        {"id": OA + "keywords/semantic-web", "display_name": "Semantic web", "score": 0.7},
+        {"id": OA + "keywords/rdf", "display_name": "RDF", "score": 0.4},
+    ],
+}
+
+
+class TestKGMapper(TestCase):
+    def test_short_id(self):
+        self.assertEqual(short_id("https://openalex.org/W12"), "W12")
+        self.assertEqual(short_id("https://openalex.org/keywords/semantic-web"), "keywords/semantic-web")
+        self.assertEqual(short_id("W12"), "W12")
+
+    def test_edge_vocab_has_six_terms(self):
+        self.assertEqual(len(EDGE_VOCAB), 6)
+        self.assertEqual(EDGE_VOCAB["CITES"], "cito:cites")
+
+    def test_full_work_counts(self):
+        nodes, edges = work_to_graph(FULL_WORK)
+        by_type = Counter(n.node_type for n in nodes)
+        self.assertEqual(by_type, {"paper": 4, "author": 2, "institution": 1, "venue": 1, "topic": 2, "keyword": 2})
+        by_edge = Counter(e.edge_type for e in edges)
+        self.assertEqual(by_edge, {"CITES": 3, "AUTHORED_BY": 2, "AFFILIATED_WITH": 1,
+                                   "PUBLISHED_IN": 1, "HAS_TOPIC": 2, "HAS_KEYWORD": 2})
+
+    def test_paper_node_is_hydrated(self):
+        nodes, _ = work_to_graph(FULL_WORK)
+        paper = next(n for n in nodes if n.key == "W1")
+        self.assertFalse(paper.is_stub)
+        self.assertEqual(paper.label, "Linked data")
+        self.assertEqual(paper.properties, {
+            "doi": "https://doi.org/10.1000/x", "year": 2020, "type": "article",
+            "cited_by_count": 7, "fwci": 1.5, "referenced_works_count": 3})
+
+    def test_referenced_works_are_stubs(self):
+        nodes, edges = work_to_graph(FULL_WORK)
+        stubs = [n for n in nodes if n.key in {"W10", "W11", "W12"}]
+        self.assertEqual(len(stubs), 3)
+        for n in stubs:
+            self.assertTrue(n.is_stub)
+            self.assertEqual(n.label, "")
+            self.assertEqual(n.node_type, "paper")
+        cites = [e for e in edges if e.edge_type == "CITES"]
+        self.assertEqual({(e.source_key, e.target_key) for e in cites},
+                         {("W1", "W10"), ("W1", "W11"), ("W1", "W12")})
+
+    def test_topic_edge_carries_score_and_primary(self):
+        _, edges = work_to_graph(FULL_WORK)
+        topic = {e.target_key: e for e in edges if e.edge_type == "HAS_TOPIC"}
+        self.assertEqual(topic["T1"].weight, 0.9)
+        self.assertFalse(topic["T1"].properties["is_primary"])
+        self.assertEqual(topic["T2"].weight, 0.5)
+        self.assertTrue(topic["T2"].properties["is_primary"])
+
+    def test_first_topic_is_primary_without_primary_topic(self):
+        work = {**FULL_WORK, "primary_topic": None}
+        _, edges = work_to_graph(work)
+        topic = {e.target_key: e for e in edges if e.edge_type == "HAS_TOPIC"}
+        self.assertTrue(topic["T1"].properties["is_primary"])
+        self.assertFalse(topic["T2"].properties["is_primary"])
+
+    def test_authorship_properties(self):
+        nodes, edges = work_to_graph(FULL_WORK)
+        authored = {e.target_key: e for e in edges if e.edge_type == "AUTHORED_BY"}
+        self.assertEqual(authored["A1"].properties, {"position": "first", "is_corresponding": True})
+        self.assertEqual(authored["A2"].properties, {"position": "last", "is_corresponding": False})
+        aff = next(e for e in edges if e.edge_type == "AFFILIATED_WITH")
+        self.assertEqual((aff.source_key, aff.target_key, aff.properties), ("A1", "I1", {"year": 2020}))
+
+    def test_shared_institution_is_one_node(self):
+        work = {**FULL_WORK, "authorships": [
+            {"author": {"id": OA + "A1", "display_name": "Ada"}, "institutions": [{"id": OA + "I1", "display_name": "U"}]},
+            {"author": {"id": OA + "A2", "display_name": "Bob"}, "institutions": [{"id": OA + "I1", "display_name": "U"}]},
+        ]}
+        nodes, edges = work_to_graph(work)
+        self.assertEqual(sum(n.node_type == "institution" for n in nodes), 1)
+        self.assertEqual(sum(e.edge_type == "AFFILIATED_WITH" for e in edges), 2)
+
+    def test_duplicate_references_are_collapsed(self):
+        work = {"id": OA + "W5", "referenced_works": [OA + "W9", OA + "W9"]}
+        nodes, edges = work_to_graph(work)
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(len(edges), 1)
+
+    def test_sparse_work_does_not_raise(self):
+        nodes, edges = work_to_graph({"id": OA + "W5", "title": None, "primary_location": None,
+                                      "authorships": [], "referenced_works": None})
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(edges, [])
+
+    def test_null_source_and_no_id_work(self):
+        nodes, edges = work_to_graph({"id": OA + "W5", "primary_location": {"source": None}})
+        self.assertEqual((len(nodes), len(edges)), (1, 0))
+        self.assertEqual(work_to_graph({"title": "x"}), ([], []))
+
+    def test_authorship_without_author_id_is_skipped(self):
+        work = {"id": OA + "W5", "authorships": [
+            {"author": {"id": None, "display_name": "Ghost"}, "institutions": [{"id": OA + "I1"}]},
+            {"author": None},
+        ]}
+        nodes, edges = work_to_graph(work)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(edges, [])
