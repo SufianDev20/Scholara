@@ -302,3 +302,67 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self):
         return self.clerk_id
+
+
+class KGNode(models.Model):
+    """A node in the knowledge graph. `key` is the OpenAlex ID without its URL prefix."""
+
+    NODE_TYPES = [
+        ("paper", "Paper"),
+        ("author", "Author"),
+        ("institution", "Institution"),
+        ("venue", "Venue"),
+        ("topic", "Topic"),
+        ("keyword", "Keyword"),
+    ]
+
+    node_type = models.CharField(max_length=20, choices=NODE_TYPES)
+    key = models.CharField(max_length=120, unique=True)
+    label = models.TextField(blank=True, default="")
+    properties = models.JSONField(default=dict, blank=True)
+    is_stub = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.node_type}:{self.key}"
+
+
+class KGEdge(models.Model):
+    """A typed, weighted edge between two KGNode rows."""
+
+    EDGE_TYPES = [
+        ("CITES", "Cites"),
+        ("AUTHORED_BY", "Authored by"),
+        ("AFFILIATED_WITH", "Affiliated with"),
+        ("PUBLISHED_IN", "Published in"),
+        ("HAS_TOPIC", "Has topic"),
+        ("HAS_KEYWORD", "Has keyword"),
+        ("SAME_AS", "Same as"),
+    ]
+
+    source = models.ForeignKey(
+        KGNode, on_delete=models.CASCADE, related_name="out_edges"
+    )
+    target = models.ForeignKey(
+        KGNode, on_delete=models.CASCADE, related_name="in_edges"
+    )
+    edge_type = models.CharField(max_length=20, choices=EDGE_TYPES)
+    weight = models.FloatField(default=1.0)
+    properties = models.JSONField(default=dict, blank=True)
+    provenance = models.CharField(max_length=30, default="openalex")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["source", "target", "edge_type"], name="kg_edge_unique"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["edge_type", "source"], name="kg_edge_type_src_idx"),
+            models.Index(fields=["edge_type", "target"], name="kg_edge_type_tgt_idx"),
+        ]
+
+    def __str__(self):
+        return f"{self.source_id} -{self.edge_type}-> {self.target_id}"

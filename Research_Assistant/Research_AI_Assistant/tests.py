@@ -14,11 +14,19 @@ import json
 from datetime import timedelta
 from unittest.mock import MagicMock, Mock, patch
 
+from django.db import IntegrityError, transaction
 from django.test import TestCase, Client, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from .models import ModelPerformance, ModelReliability, PaperQAChunks, User
+from .models import (
+    KGEdge,
+    KGNode,
+    ModelPerformance,
+    ModelReliability,
+    PaperQAChunks,
+    User,
+)
 from .services.llm_service import LLMError, STREAM_RESET
 from .services.qa_chunk_cache import CHUNK_SCHEMA_VERSION, QAChunkCache
 from .services.performance_tracker import (
@@ -1912,3 +1920,23 @@ class TestLLMInputCaps(ClerkAuthTestMixin, TestCase):
         self.assertEqual(resp.status_code, 200)
         sent = mock_get_llm.return_value.complete.call_args[1]["user_message"]
         self.assertEqual(sent.count("§"), 5 * 2000)
+
+
+class TestKGModels(TestCase):
+    def test_node_key_is_unique(self):
+        KGNode.objects.create(node_type="paper", key="W1", label="A")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            KGNode.objects.create(node_type="paper", key="W1", label="B")
+
+    def test_edge_is_unique_per_type(self):
+        a = KGNode.objects.create(node_type="paper", key="W1")
+        b = KGNode.objects.create(node_type="paper", key="W2")
+        KGEdge.objects.create(source=a, target=b, edge_type="CITES")
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            KGEdge.objects.create(source=a, target=b, edge_type="CITES")
+
+    def test_edge_defaults(self):
+        a = KGNode.objects.create(node_type="paper", key="W1")
+        b = KGNode.objects.create(node_type="author", key="A1")
+        e = KGEdge.objects.create(source=a, target=b, edge_type="AUTHORED_BY")
+        self.assertEqual((e.weight, e.provenance, e.properties), (1.0, "openalex", {}))

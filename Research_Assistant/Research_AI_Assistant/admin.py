@@ -13,6 +13,8 @@ from .models import (
     ModelReliability,
     PaperExtraction,
     PaperQAChunks,
+    KGNode,
+    KGEdge,
 )
 
 
@@ -227,6 +229,20 @@ class PaperQAChunksAdmin(admin.ModelAdmin):
     list_display = ["openalex_id", "page_count", "qa_chunk_version", "qa_last_attempt_at"]
     search_fields = ["openalex_id", "qa_source_pdf_url"]
     readonly_fields = ["qa_chunks", "qa_last_attempt_at"]
+
+
+@admin.register(KGNode)
+class KGNodeAdmin(admin.ModelAdmin):
+    list_display = ["node_type", "key", "label"]
+    list_filter = ["node_type", "is_stub"]
+    search_fields = ["key", "label"]
+
+
+@admin.register(KGEdge)
+class KGEdgeAdmin(admin.ModelAdmin):
+    list_display = ["edge_type", "source", "target"]
+    list_filter = ["edge_type"]
+    raw_id_fields = ["source", "target"]
 
 
 # Customize admin site header
