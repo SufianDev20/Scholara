@@ -21,7 +21,9 @@ from Research_AI_Assistant.services.pdf_service import (
     PDFService,
     fetch_pdf_bytes,
 )
+from Research_AI_Assistant.services.llm_service import STREAM_RESET
 from Research_AI_Assistant.services.qa_llm import (
+    QA_MAX_TOKENS,
     QACompletionError,
     QACompletionService,
     build_paper_legend,
@@ -76,7 +78,30 @@ class TestQALlm(unittest.TestCase):
         call = openrouter.complete.call_args.kwargs
         self.assertEqual(call["request_type"], "qa")
         self.assertEqual(call["temperature"], 0.1)
-        self.assertEqual(call["max_tokens"], 800)
+        self.assertEqual(call["max_tokens"], QA_MAX_TOKENS)
+
+    def test_ask_streaming_discards_tokens_from_a_model_that_was_reset(self):
+        """A backend that falls through to another model after streaming
+        tokens sends STREAM_RESET: the caller is told to discard what it has
+        shown, and the answer comes from the last model only."""
+        llm = MagicMock()
+        llm.stream_complete.return_value = iter([
+            '{"answer":"cut off by the first mo',
+            STREAM_RESET,
+            '{"answer":"Second model answer",',
+            '"citations":[]}',
+        ])
+
+        events = list(QACompletionService.ask_streaming(
+            llm,
+            [{"paper_id": "W1", "page": 2, "text": "Supported evidence."}],
+            "What is supported?",
+        ))
+
+        self.assertEqual(
+            [kind for kind, _ in events], ["token", "reset", "token", "token", "done"]
+        )
+        self.assertEqual(events[-1][1]["answer"], "Second model answer")
 
     def test_paper_label_formats_one_two_and_many_authors(self):
         self.assertEqual(paper_label({"authors": ["Ann Smith"]}, "Paper 1"), "Smith")
@@ -353,7 +378,29 @@ class TestQAPipeline(unittest.TestCase):
 
 
 class TestPDFService(unittest.TestCase):
-    def test_fetch_pdf_bytes_rejects_content_length_over_limit(self):
+    @override_settings(OPENALEX_API_KEY="openalex-test-key")
+    def test_fetch_pdf_bytes_authenticates_openalex_content_url(self):
+        response = MagicMock()
+        response.headers = {"Content-Length": "4"}
+        response.iter_content = MagicMock(return_value=iter([b"%PDF"]))
+
+        with patch(
+            "Research_AI_Assistant.services.pdf_service.requests.get",
+            return_value=response,
+        ) as get:
+            self.assertEqual(
+                fetch_pdf_bytes(
+                    "https://content.openalex.org/works/W1.pdf", "W1"
+                ),
+                b"%PDF",
+            )
+
+        self.assertEqual(get.call_args.kwargs["params"], {"api_key": "openalex-test-key"})
+
+    # example.test never resolves, so the SSRF guard's DNS lookup is patched
+    # out; these tests are about the size limit, not the guard.
+    @patch("Research_AI_Assistant.services.pdf_service._reject_unsafe_pdf_url")
+    def test_fetch_pdf_bytes_rejects_content_length_over_limit(self, _guard):
         response = MagicMock()
         response.headers = {"Content-Length": str(MAX_PDF_BYTES + 1)}
         response.content = b"small"
@@ -365,7 +412,8 @@ class TestPDFService(unittest.TestCase):
             with self.assertRaisesRegex(PDFExtractionError, "too large"):
                 fetch_pdf_bytes("https://example.test/a.pdf", "W1")
 
-    def test_fetch_pdf_bytes_rejects_download_over_limit(self):
+    @patch("Research_AI_Assistant.services.pdf_service._reject_unsafe_pdf_url")
+    def test_fetch_pdf_bytes_rejects_download_over_limit(self, _guard):
         """
         A server with no (or a false) Content-Length must still be stopped
         mid-download, not after the whole body is already in memory.
@@ -380,7 +428,7 @@ class TestPDFService(unittest.TestCase):
             "Research_AI_Assistant.services.pdf_service.requests.get",
             return_value=response,
         ):
-            with self.assertRaisesRegex(PDFExtractionError, "exceeds 50MB"):
+            with self.assertRaisesRegex(PDFExtractionError, "exceeds 15MB"):
                 fetch_pdf_bytes("https://example.test/a.pdf", "W1")
 
     @override_settings(MEDIA_ROOT=tempfile.gettempdir())
@@ -513,6 +561,146 @@ class TestQARequestSerializerCandidates(unittest.TestCase):
     def test_overlong_url_rejected(self):
         _, ok = self._validate({"W1": ["https://e.example/" + "a" * 500]})
         self.assertFalse(ok)
+
+
+class TestOcrAndGarbleRetry(unittest.TestCase):
+    """OCR logging and the one-shot garbled-text retry in _fetch_and_chunk_one."""
+
+    @staticmethod
+    def _dl():
+        from io import StringIO
+
+        return SimpleNamespace(
+            INFO_MESSAGES=StringIO(),
+            OCRMode=SimpleNamespace(FORCE_DROP_OLD="force-drop", NEVER="never"),
+        )
+
+    def _run(self, to_markdown, dl):
+        pm4 = SimpleNamespace(to_markdown=to_markdown)
+        modules = {
+            "pymupdf4llm": pm4,
+            "pymupdf4llm.helpers": SimpleNamespace(document_layout=dl),
+            "pymupdf4llm.helpers.document_layout": dl,
+            "pymupdf": SimpleNamespace(open=lambda **kw: MagicMock()),
+        }
+        with patch(
+            "Research_AI_Assistant.services.qa_pipeline.fetch_pdf_bytes",
+            return_value=b"pdf bytes",
+        ), patch.dict(sys.modules, modules):
+            return QAChunkService.fetch_and_chunk("https://example.test/a.pdf", "W1")
+
+    def test_garble_check_thresholds(self):
+        from Research_AI_Assistant.services import qa_pipeline as qp
+
+        self.assertFalse(qp._looks_garbled("Clean prose. " * 40))
+        self.assertTrue(qp._looks_garbled("�" * 300))
+        self.assertFalse(qp._looks_garbled("�" * 50))  # too short to judge
+        # Table/number-heavy but readable: letters ~0.3-0.4, must NOT be garbled.
+        self.assertFalse(qp._looks_garbled("| col value | 12 | 3.4 | 567 |\n" * 30))
+        # True gibberish: letters well under 0.3.
+        self.assertTrue(qp._looks_garbled("|@#1| 2| 3|@#|45|@#|6|\n" * 30))
+
+    def test_buffer_window_holds_the_lock(self):
+        # The clear->extract->count window must run under _OCR_LOG_LOCK so a
+        # concurrent request cannot clear the shared buffer mid-extraction.
+        from io import StringIO
+
+        from Research_AI_Assistant.services import qa_pipeline as qp
+
+        dl = SimpleNamespace(
+            INFO_MESSAGES=StringIO(),
+            OCRMode=SimpleNamespace(FORCE_DROP_OLD="force-drop", NEVER="never"),
+        )
+        held = {}
+
+        def to_markdown(doc, **kwargs):
+            # If the lock is already held by us, a non-blocking acquire fails.
+            held["locked"] = not qp._OCR_LOG_LOCK.acquire(blocking=False)
+            if not held["locked"]:
+                qp._OCR_LOG_LOCK.release()
+            return [{"metadata": {"page_number": 1}, "text": "x" * 10}]
+
+        pm4 = SimpleNamespace(to_markdown=to_markdown)
+        with patch.dict(
+            sys.modules, {"pymupdf": SimpleNamespace(open=lambda **k: MagicMock())}
+        ):
+            qp.QAChunkService._to_markdown_pages(b"bytes", "W1", pm4, dl)
+        self.assertTrue(held["locked"])
+
+    def test_clean_text_is_extracted_without_retry(self):
+        clean = [{"metadata": {"page_number": 1}, "text": "Clean prose. " * 40}]
+        to_md = MagicMock(return_value=clean)
+
+        result = self._run(to_md, self._dl())
+
+        self.assertEqual(to_md.call_count, 1)
+        self.assertNotIn("use_ocr", to_md.call_args.kwargs)
+        self.assertEqual(result["chunks"][0]["page"], 1)
+
+    @override_settings(QA_ALLOW_OCR=False)
+    def test_ocr_off_disables_layout_and_reads_plain_page_key(self):
+        # With OCR off the ONNX layout path is switched off; the plain PyMuPDF
+        # path labels pages "page", not "page_number", and must still chunk.
+        plain = [
+            {"metadata": {"page": 1}, "text": "Clean prose. " * 40},
+            {"metadata": {"page": 2}, "text": "More prose. " * 40},
+        ]
+        to_md = MagicMock(return_value=plain)
+        use_layout = MagicMock()
+        pm4 = SimpleNamespace(to_markdown=to_md, use_layout=use_layout)
+        dl = self._dl()
+        modules = {
+            "pymupdf4llm": pm4,
+            "pymupdf4llm.helpers": SimpleNamespace(document_layout=dl),
+            "pymupdf4llm.helpers.document_layout": dl,
+            "pymupdf": SimpleNamespace(open=lambda **kw: MagicMock()),
+        }
+        with patch(
+            "Research_AI_Assistant.services.qa_pipeline.fetch_pdf_bytes",
+            return_value=b"pdf bytes",
+        ), patch.dict(sys.modules, modules):
+            result = QAChunkService.fetch_and_chunk("https://example.test/a.pdf", "W1")
+
+        use_layout.assert_called_once_with(False)
+        self.assertNotIn("use_ocr", to_md.call_args.kwargs)
+        self.assertEqual([c["page"] for c in result["chunks"]], [1, 2])
+
+    @override_settings(QA_ALLOW_OCR=True)
+    def test_garbled_text_retries_with_ocr_forced(self):
+        junk = [{"metadata": {"page_number": 1}, "text": "�" * 300}]
+        clean = [{"metadata": {"page_number": 1}, "text": "Clean prose. " * 40}]
+        to_md = MagicMock(side_effect=[junk, clean])
+
+        result = self._run(to_md, self._dl())
+
+        self.assertEqual(to_md.call_count, 2)
+        self.assertEqual(to_md.call_args.kwargs["use_ocr"], "force-drop")
+        self.assertIn("Clean prose", result["chunks"][0]["text"])
+
+    @override_settings(QA_ALLOW_OCR=True)
+    def test_ocr_already_ran_skips_retry(self):
+        dl = self._dl()
+
+        def run_with_ocr(*args, **kwargs):
+            dl.INFO_MESSAGES.write("OCR on page.number=1/2.\n")
+            return [{"metadata": {"page_number": 1}, "text": "�" * 300}]
+
+        to_md = MagicMock(side_effect=run_with_ocr)
+
+        self._run(to_md, dl)
+
+        self.assertEqual(to_md.call_count, 1)
+
+    @override_settings(QA_ALLOW_OCR=True)
+    def test_worse_retry_is_ignored(self):
+        first = [{"metadata": {"page_number": 1}, "text": "�" * 300}]
+        worse = [{"metadata": {"page_number": 1}, "text": "�" * 301}]
+        to_md = MagicMock(side_effect=[first, worse])
+
+        result = self._run(to_md, self._dl())
+
+        self.assertEqual(to_md.call_count, 2)
+        self.assertEqual(result["chunks"][0]["text"], "�" * 300)
 
 
 if __name__ == "__main__":

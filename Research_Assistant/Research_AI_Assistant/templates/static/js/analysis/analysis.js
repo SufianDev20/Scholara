@@ -6,23 +6,12 @@
 // state.session.turns and rendered in its own node. Turns are never replaced
 // wholesale, so a slow answer cannot overwrite a newer one.
 
-import { fetchResearchPapers, requestPaperAnalysis, isPublisherBlock } from "./analysis_api.js";
+import { fetchResearchPapers, requestPaperAnalysis, requestPaperAnalysisStream, isPublisherBlock } from "./analysis_api.js";
+import { getCsrfToken, escapeHtml, doiUrl } from "../utils.js";
+import { MAX_ANALYZABLE_PAPERS } from "../constants.js";
 
 const SESSION_KEY = "scholara:analysisSession";
-const MAX_ANALYZABLE_PAPERS = 10; // matches QARequestSerializer cap
 const MAX_TURNS = 20; // sessionStorage is ~5MB and a transcript grows without bound
-
-function getCsrfToken() {
-  const input = document.querySelector('[name=csrfmiddlewaretoken]');
-  if (input?.value) return input.value;
-  const match = document.cookie.match(/(?:^|; )csrftoken=([^;]+)/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-function escapeHtml(str) {
-  if (str == null) return "";
-  return String(str).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
 
 function formatAuthors(paper, limit = 3) {
   const names = (paper?.authors ?? []).map((a) => a?.name).filter(Boolean);
@@ -233,8 +222,16 @@ function renderSelectedCard(paper) {
   const metaParts = [paper.publication_year, paper.source].filter(Boolean);
   if (typeof paper.cited_by_count === "number") metaParts.push(`${paper.cited_by_count.toLocaleString()} citations`);
 
-  const linkUrl = paper.pdf_url || paper.oa_url || (paper.doi ? `https://doi.org/${paper.doi}` : null);
-  const linkHtml = linkUrl ? `<a class="an-detail__link" href="${escapeHtml(linkUrl)}" target="_blank" rel="noopener noreferrer">View source ↗</a>` : "";
+  const pdfUrl = paper.pdf_url || paper.full_text_url || paper.oa_url || "";
+  const doi = paper.doi || "";
+  const linksHtml = [
+    pdfUrl
+      ? `<a class="an-detail__link" href="${escapeHtml(pdfUrl)}" target="_blank" rel="noopener noreferrer">Open PDF / full text ↗</a>`
+      : "",
+    doi
+      ? `<a class="an-detail__link" href="${escapeHtml(doiUrl(doi))}" target="_blank" rel="noopener noreferrer">Open DOI ↗</a>`
+      : "",
+  ].filter(Boolean).join(" · ");
 
   // Only rendered if the backend attaches these fields later; never fabricated here.
   const optionalSections = ["summary", "methodology", "findings"]
@@ -253,7 +250,7 @@ function renderSelectedCard(paper) {
     <div class="an-detail__section">
       <h4>Citation</h4>
       <p class="an-detail__citation">${escapeHtml(buildCitationLine(paper))}</p>
-      ${linkHtml}
+      ${linksHtml ? `<p>${linksHtml}</p>` : ""}
     </div>
   `;
 }
@@ -349,6 +346,13 @@ function turnBodyHtml(turn) {
         <svg class="an-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><use href="#i-eye"></use></svg>
         <p>Analyzing across your papers…</p>
       </div>
+    `;
+  }
+
+  if (turn.status === "streaming") {
+    return `
+      ${excludedPapersNote(turn.excludedTitles)}
+      <div class="an-answer an-answer--streaming"><span class="an-streaming__waiting">Generating answer…</span><span class="an-cursor"></span></div>
     `;
   }
 
@@ -462,10 +466,11 @@ function renderTranscript() {
   state.session.turns.forEach((turn) => {
     // A turn left pending by a reload can never resolve; show it as failed
     // rather than spinning forever.
-    if (turn.status === "pending") {
+    if (turn.status === "pending" || turn.status === "streaming") {
       turn.status = "error";
       turn.error = "This question was interrupted before an answer came back.";
       turn.retryable = true;
+      turn.streamedTokens = undefined;
     }
     els.transcript.appendChild(buildTurnNode(turn));
   });
@@ -541,25 +546,56 @@ async function runAnalysis(turn) {
   );
 
   try {
-    const result = await requestPaperAnalysis({
-      paperIds,
-      question: turn.question,
-      pdfUrls,
-      paperMeta,
-      csrfToken: getCsrfToken(),
-      signal: controller.signal,
+    await new Promise((resolve, reject) => {
+      let streamFailed = false;
+      requestPaperAnalysisStream({
+        paperIds,
+        question: turn.question,
+        pdfUrls,
+        paperMeta,
+        csrfToken: getCsrfToken(),
+        signal: controller.signal,
+        onProgress(data) {
+          if (data.paper_errors) turn.paperErrors = data.paper_errors;
+          if (data.papers) turn.papers = data.papers;
+          if (data.context_trimmed != null) turn.contextTrimmed = data.context_trimmed;
+          if (data.context_papers) turn.coverage = data.context_papers;
+          turn.status = "streaming";
+          turn.streamedTokens = "";
+          updateTurn(turn);
+        },
+        onToken(text) {
+          turn.streamedTokens = (turn.streamedTokens || "") + text;
+          updateTurn(turn);
+          scrollTranscriptToEnd();
+        },
+        onReset() {
+          turn.streamedTokens = "";
+          updateTurn(turn);
+        },
+        onDone(result) {
+          turn.status = "done";
+          turn.answer = result.answer;
+          turn.citations = result.citations;
+          turn.papers = result.papers;
+          turn.paperErrors = result.paper_errors;
+          turn.contextTrimmed = result.context_trimmed;
+          turn.coverage = result.context_papers;
+          turn.streamedTokens = undefined;
+          updateTurn(turn);
+          renderSelectedPapers();
+          resolve();
+        },
+        onError(msg) {
+          streamFailed = true;
+          reject(new Error(msg));
+        },
+      }).then(() => {
+        if (!streamFailed) resolve();
+      }).catch(reject);
     });
-    turn.status = "done";
-    turn.answer = result.answer;
-    turn.citations = result.citations;
-    turn.papers = result.papers;
-    turn.paperErrors = result.paper_errors;
-    turn.contextTrimmed = result.context_trimmed;
-    turn.coverage = result.context_papers;
-    updateTurn(turn);
-    renderSelectedPapers(); // coverage bars follow the newest answer
   } catch (err) {
-    if (err?.name === "AbortError") return; // page is going away
+    if (err?.name === "AbortError") return;
     failTurn(turn, err?.message || "Unknown error.", { retryable: true, status: err?.status ?? null });
   } finally {
     setBusy(false);

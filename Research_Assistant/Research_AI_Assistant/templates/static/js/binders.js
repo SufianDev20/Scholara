@@ -40,36 +40,35 @@ DOMManager.prototype.createBinderElement = function(binder) {
       ? binder.papers[0].title
       : null;
 
+  // Names, paper titles and messages are untrusted text (LLM output and
+  // paper metadata): escape every value before innerHTML.
+  var esc = this.escapeHtml;
+  var color = esc(binder.color);
+
   var card = document.createElement("div");
   card.className = "binder-card";
-  var self = this;
-  card.onclick = function () {
-    return self.openBinder(binder.id);
-  };
+  card.dataset.binderId = binder.id;
 
-  // Build HTML string with compatible syntax
+  // Build HTML string with compatible syntax. Actions are marked with
+  // data-action and wired below via one delegated listener on the card,
+  // instead of onclick="globalFn(...)" strings tied to window-attached
+  // functions.
   var html =
     '<div style="background: ' +
-    binder.color +
+    color +
     '" class="binder-color-bar"></div>' +
     '<div class="binder-content">' +
     '<div class="binder-header">' +
-    '<div onclick="event.stopImmediatePropagation(); editBinderColor(\'' +
-    binder.id +
-    '\');" ' +
+    '<div data-action="edit-color" ' +
     'style="background: ' +
-    binder.color +
+    color +
     '" class="binder-color-dot"></div>' +
     '<div contenteditable="true" spellcheck="false" ' +
-    'onblur="saveBinderName(\'' +
-    binder.id +
-    '\', this.innerText)" ' +
+    'data-action="rename" ' +
     'class="binder-title">' +
-    binder.name +
+    esc(binder.name) +
     "</div>" +
-    '<button onclick="event.stopImmediatePropagation(); deleteBinder(\'' +
-    binder.id +
-    '\');" ' +
+    '<button data-action="delete" ' +
     'class="binder-delete-btn" title="Delete binder">' +
     '<i class="fa-solid fa-trash"></i>' +
     "</button>" +
@@ -81,8 +80,9 @@ DOMManager.prototype.createBinderElement = function(binder) {
       '<div class="binder-paper-preview">' +
       '<div class="binder-paper-label">Latest Paper</div>' +
       '<div class="binder-paper-title">' +
-      (firstPaper.substring(0, 80) +
-        (firstPaper.length > 80 ? "..." : "")) +
+      esc(
+        firstPaper.substring(0, 80) + (firstPaper.length > 80 ? "..." : ""),
+      ) +
       "</div>" +
       "</div>";
   }
@@ -116,8 +116,9 @@ DOMManager.prototype.createBinderElement = function(binder) {
       '<div class="binder-last-message">' +
       '<div class="binder-last-message-text">' +
       '"' +
-      (lastMessage.substring(0, 60) +
-        (lastMessage.length > 60 ? "..." : "")) +
+      esc(
+        lastMessage.substring(0, 60) + (lastMessage.length > 60 ? "..." : ""),
+      ) +
       '"' +
       "</div>" +
       "</div>";
@@ -125,6 +126,33 @@ DOMManager.prototype.createBinderElement = function(binder) {
 
   html += "</div>";
   card.innerHTML = html;
+
+  card.addEventListener(
+    "click",
+    function (e) {
+      var actionEl = e.target.closest("[data-action]");
+      if (!actionEl) {
+        this.openBinder(binder.id);
+        return;
+      }
+      e.stopImmediatePropagation();
+      if (actionEl.dataset.action === "edit-color") {
+        this.editBinderColor(binder.id);
+      } else if (actionEl.dataset.action === "delete") {
+        this.deleteBinder(binder.id);
+      }
+    }.bind(this),
+  );
+
+  // blur does not bubble; focusout does, so delegation still works here.
+  card.addEventListener(
+    "focusout",
+    function (e) {
+      if (e.target.matches('[data-action="rename"]')) {
+        this.saveBinderName(binder.id, e.target.innerText);
+      }
+    }.bind(this),
+  );
 
   return card;
 };
@@ -156,9 +184,9 @@ DOMManager.prototype.deleteBinder = function(binderId) {
   console.log("Deleting binder:", binderId, binder.name);
 
   // Add removing animation
-  const binderElement = document
-    .querySelector(`[onclick*="${binderId}"]`)
-    ?.closest(".binder-card");
+  const binderElement = this.elements.bindersContainer?.querySelector(
+    `[data-binder-id="${binderId}"]`,
+  );
   if (binderElement) {
     binderElement.style.transition = "all 0.3s ease";
     binderElement.style.opacity = "0";
@@ -175,19 +203,6 @@ DOMManager.prototype.deleteBinder = function(binderId) {
     this.renderBinders();
     console.log("Binder deleted successfully:", binderId);
   }
-};
-
-DOMManager.prototype.createNewBinder = function() {
-  const binder = {
-    id: "binder-" + Date.now(),
-    name: "New Research Binder",
-    color: "#" + Math.floor(Math.random() * 16777215).toString(16),
-    messages: [],
-    papers: [],
-  };
-  window.appState.binders.unshift(binder);
-  this.renderBinders();
-  this.openBinder(binder.id);
 };
 
 // Opens Binder that is after saving
@@ -236,6 +251,7 @@ DOMManager.prototype.openBinder = function(id) {
         );
         if (msg.role === "assistant") {
           div.innerHTML = this.markdownToHtml(msg.content);
+          this.addPaperDetails(div, binder.papers);
           div.style.opacity = "1";
         }
       }.bind(this),
@@ -258,7 +274,6 @@ DOMManager.prototype.saveBinderName = function(binderId, newName) {
 };
 
 DOMManager.prototype.editBinderColor = function(binderId) {
-  event.stopImmediatePropagation();
   const binder = window.appState.binders.find((b) => b.id === binderId);
   if (!binder) return;
 
@@ -271,9 +286,9 @@ DOMManager.prototype.editBinderColor = function(binderId) {
 
   colorPicker.onchange = function () {
     binder.color = this.value;
-    domManager.renderBinders();
+    this.renderBinders();
     document.body.removeChild(colorPicker);
-  };
+  }.bind(this);
 
   colorPicker.click();
 };

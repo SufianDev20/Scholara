@@ -43,6 +43,11 @@ OPENROUTER_PIN_DEFAULT_MODEL = env.bool("OPENROUTER_PIN_DEFAULT_MODEL", default=
 OPENROUTER_MODELS_CACHE_SECONDS = env.int(
     "OPENROUTER_MODELS_CACHE_SECONDS", default=6 * 60 * 60
 )
+# Q&A only: at most this many models per question (each attempt uses one of
+# the 50 free requests/day under 10 credits), and stop walking the chain once
+# this many seconds have passed. Non-reasoning models are tried first.
+OPENROUTER_QA_MAX_MODELS = env.int("OPENROUTER_QA_MAX_MODELS", default=4)
+OPENROUTER_QA_DEADLINE_SECONDS = env.int("OPENROUTER_QA_DEADLINE_SECONDS", default=90)
 
 # University research server (PostgreSQL corpus + Ollama), reached through the
 # Cloudflare tunnel. An empty URL or key disables the local corpus and Ollama.
@@ -59,7 +64,21 @@ RESEARCH_READ_TIMEOUT_SECONDS = (
 LLM_BACKEND = env("LLM_BACKEND", default="openrouter")
 LLM_TIMEOUT = (6, env.int("LLM_READ_TIMEOUT_SECONDS", default=240))
 LLM_JOB_DEADLINE_SECONDS = env.int("LLM_JOB_DEADLINE_SECONDS", default=240)
+# Q&A context is large; this server fails on it (~241s). Give up fast so the
+# OpenRouter fallback is reached in seconds. Summary keeps the full deadline.
+LLM_QA_JOB_DEADLINE_SECONDS = env.int("LLM_QA_JOB_DEADLINE_SECONDS", default=60)
 LLM_NUM_CTX = env.int("LLM_NUM_CTX", default=8192)
+
+# When False (default), Q&A PDF extraction skips OCR entirely to avoid the
+# ~260 MB onnxruntime memory spike that OOM-crashes small instances.  Scanned
+# PDFs without a text layer will fail gracefully instead.  Set True only on
+# hosts with ≥ 2 GB RAM.
+QA_ALLOW_OCR = env.bool("QA_ALLOW_OCR", default=False)
+
+# How many papers one Q&A request extracts at the same time. Each extraction
+# holds the whole PDF plus every page's Markdown in memory, so 1 is the safe
+# value on a 512 MB instance; raise it on hosts with more RAM for speed.
+QA_CHUNK_WORKERS = max(1, env.int("QA_CHUNK_WORKERS", default=1))
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
@@ -87,10 +106,12 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "Research_AI_Assistant.middleware.ClearPostgresRLSContextMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -120,12 +141,7 @@ WSGI_APPLICATION = "Research_Assistant.wsgi.application"
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
-    }
-}
+DATABASES = {"default": env.db_url("DATABASE_URL")}
 
 
 # Password validation
@@ -149,6 +165,18 @@ SECURE_BROWSER_XSS_FILTER = True
 SECURE_CONTENT_TYPE_NOSNIFF = True
 X_FRAME_OPTIONS = "DENY"
 SECURE_REFERRER_POLICY = "strict-origin-when-cross-origin"
+CSRF_TRUSTED_ORIGINS = env.list("CSRF_TRUSTED_ORIGINS", default=[])
+# The host's proxy terminates HTTPS and sets X-Forwarded-Proto; without this,
+# SECURE_SSL_REDIRECT below would redirect forever.
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+if not DEBUG:
+    SECURE_SSL_REDIRECT = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = 3600
+    # Left unset on purpose: include-subdomains and preload are hard to undo,
+    # and the site runs on a host-provided subdomain we don't own.
+    SILENCED_SYSTEM_CHECKS = ["security.W005", "security.W021"]
 
 # Internationalization
 # https://docs.djangoproject.com/en/6.0/topics/i18n/
@@ -169,17 +197,35 @@ STATIC_URL = "static/"
 STATICFILES_DIRS = [
     BASE_DIR / "Research_AI_Assistant" / "templates" / "static",
 ]
+STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_STORAGE = "django.contrib.staticfiles.storage.ManifestStaticFilesStorage"
+# "throttle" holds the per-view rate-limit counters in a database table so all
+# gunicorn workers share one count (a per-process cache would multiply every
+# limit by the worker count). The table is created by migration
+# 0012_throttle_cache_table. "default" stays per-process.
+CACHES = {
+    "default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"},
+    "throttle": {
+        "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+        "LOCATION": "throttle_cache",
+    },
+}
+
 REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": [
         "rest_framework.renderers.JSONRenderer",
         # Remove BrowsableAPIRenderer in production — it adds overhead
     ],
+    # Defaults for views without their own @throttle_classes. Signed-in
+    # requests are only counted by UserRateThrottle; AnonRateThrottle skips
+    # them. The per-view limits live in Research_AI_Assistant/throttles.py.
     "DEFAULT_THROTTLE_CLASSES": [
         "rest_framework.throttling.AnonRateThrottle",
+        "rest_framework.throttling.UserRateThrottle",
     ],
     "DEFAULT_THROTTLE_RATES": {
         "anon": "100/min",
+        "user": "100/min",
     },
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "Research_AI_Assistant.authentication.ClerkAuthentication",
@@ -201,6 +247,8 @@ LOGGING = {
         "Research_AI_Assistant": {
             "handlers": ["console"],
             "level": "DEBUG" if DEBUG else "INFO",
-        }
+        },
+        "django.security": {"handlers": ["console"], "level": "WARNING"},
+        "django.request": {"handlers": ["console"], "level": "WARNING"},
     },
 }

@@ -1,4 +1,5 @@
 import { DOMManager } from './core.js';
+import { escapeHtml, doiUrl } from './utils.js';
 
 DOMManager.prototype.markdownToHtml = function(text) {
   if (!text) return "";
@@ -8,9 +9,12 @@ DOMManager.prototype.markdownToHtml = function(text) {
   const held = [];
   const hold = (html) => `@@HOLD${held.push(html) - 1}@@`;
 
-  let processedText = text
+  // The summary is LLM output built from paper metadata, so it is untrusted.
+  // Escape all of it first; every tag in the result is one the rules below
+  // add. Rules that match on ">" or quotes must match the escaped form.
+  let processedText = this.escapeHtml(text)
     .replace(/```(?:\s*\w+)?\s*\n([\s\S]*?)\n```/g, (match, p1) => {
-      const code = this.escapeHtml(p1.trim());
+      const code = p1.trim();
       return "\n\n" + hold(`<pre class="code-block"><code>${code}</code></pre>`) + "\n\n";
     })
     .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, src) => {
@@ -60,9 +64,9 @@ const PAPER_HEADING = /^(?:<h[2-4]>)?(?:<strong>)?Paper\s*<span class="cite">\[(
 const REFERENCES_HEADING = /^(?:<h[2-4]>)?(?:<strong>)?References:?(?:<\/strong>)?(?:<\/h[2-4]>)?$/i;
 const SUMMARY_FIELD = /^(?:<strong>)?(Authors?|Year|Source|DOI|Summary)(?::<\/strong>|<\/strong>:|:)\s*(.*)$/i;
 const EMPTY_FIELD_VALUE = /^(?:|n\/?a|none|unknown|not available|-)\.?$/i;
-// Only values that are unambiguously a DOI become links (the character
-// classes also keep quotes and angle brackets out of the href); anything
-// else stays plain text.
+// Only values that are unambiguously a DOI become links; anything else
+// stays plain text. Values reach these patterns already HTML-escaped (see
+// markdownToHtml), so a quote or angle bracket can only appear as an entity.
 const BARE_DOI = /^10\.\d{4,9}\/[^\s"'<>]+$/;
 const DOI_URL = /^https?:\/\/(?:dx\.)?doi\.org\/10\.\d{4,9}\/[^\s"'<>]+$/i;
 const BLOCK_TAGS = {
@@ -85,6 +89,77 @@ DOMManager.prototype.doiLinkHtml = function(value) {
   return href
     ? `<a href="${href}" target="_blank" rel="noopener noreferrer">${value}</a>`
     : value;
+};
+
+// Adds what the backend returned for each paper to its summary card: the
+// citation count, plus any of authors, year, source and DOI the summary
+// left out (or a link to the open-access copy when there is no DOI). Cards
+// are matched to papers by DOI, then by title -- never by card number,
+// since a restored binder holds several summaries' papers in one list. A
+// card that matches no paper is left exactly as the summary wrote it.
+const normDoi = (value) =>
+  String(value || "").trim().toLowerCase().replace(/^https?:\/\/(?:dx\.)?doi\.org\//, "");
+const normTitle = (value) =>
+  String(value || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+
+DOMManager.prototype.addPaperDetails = function(root, papers) {
+  if (!root || !Array.isArray(papers) || !papers.length) return;
+
+  root.querySelectorAll("article.summary-card").forEach((card) => {
+    const shown = {};
+    card.querySelectorAll(".summary-card__meta dt").forEach((dt) => {
+      shown[dt.textContent.trim().toLowerCase().replace(/^author$/, "authors")] = dt.nextElementSibling;
+    });
+    const doi = normDoi(shown.doi?.textContent);
+    const title = normTitle(card.querySelector(".summary-card__title")?.textContent);
+    const paper =
+      (doi && papers.find((p) => p && normDoi(p.doi) === doi)) ||
+      (title && papers.find((p) => p && normTitle(p.title) === title));
+    if (!paper) return;
+
+    let meta = card.querySelector(".summary-card__meta");
+    if (!meta) {
+      meta = document.createElement("dl");
+      meta.className = "summary-card__meta";
+      card.querySelector(".summary-card__title").after(meta);
+    }
+
+    // Paper metadata is untrusted text: rows are built with textContent,
+    // and links only ever point at http(s) URLs.
+    const addRow = (label, value, href) => {
+      if (value === null || value === undefined || value === "") return;
+      const row = document.createElement("div");
+      const dt = document.createElement("dt");
+      const dd = document.createElement("dd");
+      dt.textContent = label;
+      if (href) {
+        const a = document.createElement("a");
+        a.href = href;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.textContent = value;
+        dd.appendChild(a);
+      } else {
+        dd.textContent = value;
+      }
+      row.append(dt, dd);
+      meta.appendChild(row);
+    };
+
+    // Same author format as the summary prompt (prompt_builder.py)
+    const names = (paper.authors || []).map((a) => a && a.name).filter(Boolean);
+    if (!shown.authors) {
+      addRow("Authors", names.length > 3 ? names.slice(0, 3).join("; ") + " et al." : names.join("; "));
+    }
+    if (!shown.year) addRow("Year", paper.publication_year);
+    if (!shown.source) addRow("Source", paper.source);
+    if (!shown.doi) {
+      if (paper.doi) addRow("DOI", paper.doi, this.paperDoiUrl(paper.doi));
+      else if (/^https?:\/\//i.test(paper.oa_url || "")) addRow("Link", "Open access version", paper.oa_url);
+    }
+    const citations = Number(paper.cited_by_count) || 0;
+    addRow("Citations", citations.toLocaleString());
+  });
 };
 
 DOMManager.prototype.linesToBlocks = function(text) {
@@ -178,7 +253,7 @@ DOMManager.prototype.linesToBlocks = function(text) {
     } else if ((m = line.match(/^\d+[.)]\s+(.*)$/))) {
       start("ol");
       out.push(`<li>${m[1]}</li>`);
-    } else if ((m = line.match(/^>\s?(.*)$/))) {
+    } else if ((m = line.match(/^&gt;\s?(.*)$/))) {
       if (!start("quote")) out.push("<br>");
       out.push(m[1]);
     } else {
@@ -192,74 +267,13 @@ DOMManager.prototype.linesToBlocks = function(text) {
 };
 
 DOMManager.prototype.escapeHtml = function(unsafe) {
-  return unsafe
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+  return escapeHtml(unsafe);
 };
 
-DOMManager.prototype.renderPaperCards = function(papers, container) {
-  if (!papers?.length || !container) return;
-
-  const papersContainer = document.createElement("div");
-  papersContainer.className = "papers-grid mt-4 mb-4";
-
-  // Create sort bar
-  const sortBar = document.createElement("div");
-  sortBar.className = "paper-sort-bar";
-  sortBar.innerHTML = `
-    <span class="sort-label">Sort by:</span>
-    <button class="sort-btn active" data-sort="default">Relevance</button>
-    <button class="sort-btn" data-sort="citations">Most Cited</button>
-    <button class="sort-btn" data-sort="recency">Most Recent</button>
-  `;
-
-  // Sort functionality using closure over papers
-  sortBar.addEventListener("click", (e) => {
-    const btn = e.target.closest(".sort-btn");
-    if (!btn) return;
-
-    sortBar
-      .querySelectorAll(".sort-btn")
-      .forEach((b) => b.classList.remove("active"));
-    btn.classList.add("active");
-
-    const mode = btn.dataset.sort;
-    let sorted = [...papers];
-
-    if (mode === "citations") {
-      sorted.sort(
-        (a, b) => (b.cited_by_count || 0) - (a.cited_by_count || 0),
-      );
-    } else if (mode === "recency") {
-      sorted.sort(
-        (a, b) => (b.publication_year || 0) - (a.publication_year || 0),
-      );
-    }
-    // else default keeps original order
-
-    // Remove existing cards
-    const existingCards = papersContainer.querySelectorAll(".paper-card");
-    existingCards.forEach((c) => c.remove());
-
-    // Re-add title and render sorted cards
-    sorted.forEach((paper, i) => {
-      const paperCard = this.createPaperCard(paper, i);
-      papersContainer.appendChild(paperCard);
-    });
-  });
-
-  papersContainer.appendChild(sortBar);
-
-  // Add paper cards
-  papers.forEach((paper, i) => {
-    const paperCard = this.createPaperCard(paper, i);
-    papersContainer.appendChild(paperCard);
-  });
-
-  container.appendChild(papersContainer);
+// The result always starts with http(s)://, so it is safe as a link target
+// once escaped with escapeHtml.
+DOMManager.prototype.paperDoiUrl = function(doi) {
+  return doiUrl(doi);
 };
 
 DOMManager.prototype.createPaperCard = function(paper, index) {
@@ -274,6 +288,11 @@ DOMManager.prototype.createPaperCard = function(paper, index) {
       (paper.abstract.length > 150 ? "..." : "")
     : "No abstract available";
 
+  // Paper metadata is untrusted text: escape every value before innerHTML.
+  const esc = (value) => this.escapeHtml(value);
+  const doiUrl = this.paperDoiUrl(paper.doi);
+  const title = esc(paper.title || "Untitled");
+
   const card = document.createElement("div");
   card.className =
     "paper-card hover:bg-zinc-800/70 transition-colors cursor-pointer";
@@ -282,17 +301,17 @@ DOMManager.prototype.createPaperCard = function(paper, index) {
             <div class="paper-number">${index + 1}.</div>
             <div class="paper-details">
                 <div class="paper-title">
-                    ${paper.doi ? `<a href="https://doi.org/${paper.doi}" target="_blank" class="paper-link">${paper.title}</a>` : paper.title}
+                    ${doiUrl ? `<a href="${esc(doiUrl)}" target="_blank" rel="noopener noreferrer" class="paper-link">${title}</a>` : title}
                 </div>
-                <div class="paper-meta">${authors} • ${paper.publication_year || "N/A"}</div>
-                <div class="paper-abstract">${abstract}</div>
+                <div class="paper-meta">${esc(authors)} • ${esc(paper.publication_year || "N/A")}</div>
+                <div class="paper-abstract">${esc(abstract)}</div>
             </div>
         </div>
     `;
 
   card.onclick = (e) => {
-    if (!e.target.closest("a") && paper.doi) {
-      window.open(`https://doi.org/${paper.doi}`, "_blank");
+    if (!e.target.closest("a") && doiUrl) {
+      window.open(doiUrl, "_blank", "noopener");
     }
   };
 
@@ -301,17 +320,6 @@ DOMManager.prototype.createPaperCard = function(paper, index) {
 
 DOMManager.prototype.saveToBinder = function() {
   if (!window.appState.currentResearchBinder) return;
-
-  // Migrate additionalPapers to main papers array for compatibility
-  if (
-    window.appState.currentResearchBinder.additionalPapers &&
-    window.appState.currentResearchBinder.additionalPapers.length > 0
-  ) {
-    window.appState.currentResearchBinder.papers.push(
-      ...window.appState.currentResearchBinder.additionalPapers,
-    );
-    delete window.appState.currentResearchBinder.additionalPapers; // Remove old array
-  }
 
   window.appState.binders.push({ ...window.appState.currentResearchBinder });
   this.renderBinders();

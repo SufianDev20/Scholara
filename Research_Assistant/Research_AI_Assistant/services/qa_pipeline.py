@@ -11,10 +11,12 @@ the LLM call:
 The LLM-specific code remains in qa_llm.py.
 """
 
-import logging, math, re
+import logging, math, re, threading, time
 from collections import Counter
 from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple, Union
+
+from django.conf import settings as django_settings
 
 from .pdf_service import PDFExtractionError, fetch_pdf_bytes
 
@@ -28,6 +30,38 @@ FUZZY_MATCH_THRESHOLD = 0.6
 
 # Logging
 logger = logging.getLogger(__name__)
+
+# Below this many non-space chars a page is too short to judge as garbled.
+_MIN_GARBLE_CHARS = 200
+
+# pymupdf4llm writes OCR progress to a process-global buffer we clear and read
+# per call. Serialise that window so a concurrent request's lines are not
+# counted as this one's (a wrong 0 would fire a minutes-long full-OCR retry).
+_OCR_LOG_LOCK = threading.Lock()
+
+
+def _garble_stats(text: str) -> Tuple[float, float]:
+    """Return (U+FFFD share, letter share) over the non-space characters."""
+    chars = [c for c in text if not c.isspace()]
+    if not chars:
+        return 0.0, 1.0
+    bad = sum(c == "�" for c in chars) / len(chars)
+    letters = sum(c.isalpha() for c in chars) / len(chars)
+    return bad, letters
+
+
+def _looks_garbled(text: str) -> bool:
+    """True when a text layer is mostly replacement chars or non-letters."""
+    if sum(not c.isspace() for c in text) < _MIN_GARBLE_CHARS:
+        return False
+    bad, letters = _garble_stats(text)
+    return bad > 0.02 or letters < 0.3
+
+
+def _garble_score(text: str) -> float:
+    """Lower is cleaner. Used to pick between two extraction passes."""
+    bad, letters = _garble_stats(text)
+    return bad + (1 - letters)
 
 
 class QAChunkError(Exception):
@@ -112,53 +146,125 @@ class QAChunkService:
             raise QAChunkError(
                 f"No PDF Backend available. Install `pymupdf4llm`"
             ) from exc
-        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
         try:
-            page_dicts = pm4.to_markdown(
-                doc, page_chunks=True, force_text=True, write_images=False
+            from pymupdf4llm.helpers import document_layout as dl
+        except ImportError:
+            dl = None  # pymupdf4llm internals moved: OCR logging and retry are off
+
+        allow_ocr = getattr(django_settings, "QA_ALLOW_OCR", False)
+
+        if allow_ocr:
+            # Full path: text extraction, then OCR retry if garbled.
+            page_dicts, ocr_pages, text = QAChunkService._to_markdown_pages(
+                pdf_bytes, openalex_id, pm4, dl
             )
-            if not isinstance(page_dicts, list) or not page_dicts:
-                raise QAChunkError(f"No pages extracted from PDF for {openalex_id}.")
-            chunks: List[Dict] = []
-            for page_dict in page_dicts:
-                page_number = (
-                    page_dict.get("metadata", {}).get("page_number")
-                    if isinstance(page_dict, dict)
-                    else None
-                )
-
-                page_text = (
-                    page_dict.get("text", "") if isinstance(page_dict, dict) else ""
-                )
-
-                if not page_number or not page_text or not page_text.strip():
-                    continue
-
-                for sub_chunk in QAChunkService._split_page_text(page_text):
-                    chunks.append(
-                        {
-                            "paper_id": openalex_id,
-                            "page": page_number,
-                            "text": sub_chunk,
-                            "token_estimate": QAChunkService._estimate_tokens(
-                                sub_chunk
-                            ),
-                        }
+            if dl is not None and ocr_pages == 0 and _looks_garbled(text):
+                try:
+                    retry = QAChunkService._to_markdown_pages(
+                        pdf_bytes, openalex_id, pm4, dl, dl.OCRMode.FORCE_DROP_OLD
                     )
-
-            if not chunks:
+                    if _garble_score(retry[2]) < _garble_score(text):
+                        page_dicts = retry[0]
+                except Exception as exc:
+                    logger.warning("OCR retry failed for %s: %s", openalex_id, exc)
+        else:
+            # Memory-safe path. With pymupdf-layout installed, pymupdf4llm runs
+            # an ONNX layout model on every page even when OCR is off: on an
+            # 83-page PDF that peaked at ~410 MB and took ~52 s, vs ~200 MB and
+            # ~22 s on the plain PyMuPDF path. OCR needs the layout path, so
+            # only switch it off here. QA_ALLOW_OCR is process-wide, so every
+            # call sets the same value and concurrent requests cannot race.
+            if hasattr(pm4, "use_layout"):
+                pm4.use_layout(False)
+            page_dicts, _, text = QAChunkService._to_markdown_pages(
+                pdf_bytes, openalex_id, pm4, dl=None
+            )
+            if _looks_garbled(text):
                 raise QAChunkError(
-                    f"PDF for {openalex_id} produced no usable text chunks."
+                    "This paper appears to be a scanned document without a "
+                    "text layer; text extraction is not available for it."
                 )
 
-            return {
-                "chunks": chunks,
-                "page_count": len(page_dicts),
-                "error": None,
-            }
+        chunks: List[Dict] = []
+        for page_dict in page_dicts:
+            # The layout path labels pages "page_number"; the plain PyMuPDF
+            # path (used when OCR is off) labels them "page". Both are 1-based.
+            metadata = page_dict.get("metadata", {}) if isinstance(page_dict, dict) else {}
+            page_number = metadata.get("page_number") or metadata.get("page")
 
+            page_text = page_dict.get("text", "") if isinstance(page_dict, dict) else ""
+
+            if not page_number or not page_text or not page_text.strip():
+                continue
+
+            for sub_chunk in QAChunkService._split_page_text(page_text):
+                chunks.append(
+                    {
+                        "paper_id": openalex_id,
+                        "page": page_number,
+                        "text": sub_chunk,
+                        "token_estimate": QAChunkService._estimate_tokens(sub_chunk),
+                    }
+                )
+
+        if not chunks:
+            raise QAChunkError(f"PDF for {openalex_id} produced no usable text chunks.")
+
+        return {
+            "chunks": chunks,
+            "page_count": len(page_dicts),
+            "error": None,
+        }
+
+    @staticmethod
+    def _to_markdown_pages(pdf_bytes, openalex_id, pm4, dl, use_ocr=None):
+        """Run pymupdf4llm once. Returns (page_dicts, ocr_pages, joined_text)."""
+        import pymupdf
+
+        doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+        kwargs = {} if use_ocr is None else {"use_ocr": use_ocr}
+
+        # When OCR is explicitly disabled (NEVER) there are no writes to
+        # dl.INFO_MESSAGES, so the lock is unnecessary and would serialise
+        # extractions that can safely run in parallel.
+        needs_lock = dl is not None and use_ocr is not getattr(dl, "OCRMode", type(None)).NEVER
+        try:
+            if dl and needs_lock:
+                # Hold the lock across clear -> extract -> read so a concurrent
+                # request's OCR lines are never counted as this call's.
+                with _OCR_LOG_LOCK:
+                    dl.INFO_MESSAGES.seek(0)
+                    dl.INFO_MESSAGES.truncate(0)
+                    started = time.perf_counter()
+                    page_dicts = pm4.to_markdown(
+                        doc, page_chunks=True, force_text=True, write_images=False, **kwargs
+                    )
+                    elapsed = time.perf_counter() - started
+                    # pymupdf4llm prints "OCR on page.number=N/M." per OCR'd page.
+                    ocr_pages = dl.INFO_MESSAGES.getvalue().count("OCR on page.number=")
+            else:
+                started = time.perf_counter()
+                page_dicts = pm4.to_markdown(
+                    doc, page_chunks=True, force_text=True, write_images=False, **kwargs
+                )
+                elapsed = time.perf_counter() - started
+                ocr_pages = 0
         finally:
             doc.close()
+
+        if not isinstance(page_dicts, list) or not page_dicts:
+            raise QAChunkError(f"No pages extracted from PDF for {openalex_id}.")
+        text = "\n".join(
+            p.get("text") or "" for p in page_dicts if isinstance(p, dict)
+        )
+        logger.info(
+            "PDF extraction for %s: %.2fs, %d pages, %d OCR pages",
+            openalex_id,
+            elapsed,
+            len(page_dicts),
+            ocr_pages,
+        )
+        return page_dicts, ocr_pages, text
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:

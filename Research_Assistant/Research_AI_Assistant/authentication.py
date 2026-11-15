@@ -5,6 +5,8 @@ from clerk_backend_api import authenticate_request, AuthenticateRequestOptions
 from django.conf import settings
 from django.contrib.auth import get_user_model
 
+from .rls_context import set_rls_context
+
 User = get_user_model()
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,8 @@ class ClerkAuthentication(BaseAuthentication):
             clerk_id=clerk_user_id,
             defaults={"is_active": True},
         )
+
+        set_rls_context(user)
 
         return (user, None)
 

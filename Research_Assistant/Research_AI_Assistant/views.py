@@ -9,7 +9,7 @@ import re
 
 from django.conf import settings
 from django.shortcuts import render
-from django.http import JsonResponse
+from django.http import JsonResponse, StreamingHttpResponse
 from rest_framework.decorators import (
     api_view,
     authentication_classes,
@@ -17,19 +17,23 @@ from rest_framework.decorators import (
     throttle_classes,
 )
 from rest_framework.permissions import AllowAny
-from rest_framework.throttling import AnonRateThrottle
 from rest_framework.response import Response
 from rest_framework import status
 
+from .constants import DEFAULT_MIN_YEAR, DEFAULT_MAX_YEAR
+from .error_handling import handle_service_errors
 from .models import QueryLog
 from .services.local_corpus_service import LocalCorpusError, LocalCorpusService
-from .services.openalex_service import OpenAlexAPIError, OpenAlexService
+from .services.openalex_service import OpenAlexService
 from .services.extract_service import ExtractionService
 from .services.llm_service import LLMError, get_llm
 from .services.prompt_builder import (
     system_prompt,
     build_user_message,
     extract_final_summary,
+    ensure_references,
+    require_all_papers,
+    summary_max_tokens,
     InvalidSummaryFormat,
 )
 
@@ -48,22 +52,44 @@ from .services.qa_llm import (
     build_paper_legend,
 )
 from .serializers import QARequestSerializer
+from .throttles import GenerateTitle, MultiPaperQAThrottle, SearchRateThrottle
 
 logger = logging.getLogger(__name__)
 
 openalex_service = OpenAlexService()
 
 
-class SearchRateThrottle(AnonRateThrottle):
-    """Rate throttle for search requests for Annonymous users"""
+# Bounds on client text forwarded to the LLM.
+# Search returns at most 50 papers per page, so a summary never needs more.
+MAX_SUMMARY_PAPERS = 50
+# Binder messages hold whole summaries; a title only needs the gist.
+TITLE_MESSAGE_MAX_CHARS = 2000
 
-    rate = "60/m"
 
+def _parse_bounded_year(raw, param_name):
+    """
+    Parse a year query param, enforcing DEFAULT_MIN_YEAR..DEFAULT_MAX_YEAR.
 
-class GenerateTitle(AnonRateThrottle):
-    """Rate throttle for title generation requests for Annonymous users"""
-
-    rate = "20/m"
+    Returns (value, error_response): value is None (no param given) or the
+    parsed int; error_response is a 400 JsonResponse, or None if valid.
+    """
+    if raw is None:
+        return None, None
+    try:
+        value = int(raw)
+    except (ValueError, TypeError):
+        return None, JsonResponse(
+            {"error": f"{param_name} must be a valid integer"},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if value < DEFAULT_MIN_YEAR or value > DEFAULT_MAX_YEAR:
+        return None, JsonResponse(
+            {
+                "error": f"{param_name} must be between {DEFAULT_MIN_YEAR} and {DEFAULT_MAX_YEAR}"
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    return value, None
 
 
 @api_view(["GET"])
@@ -82,6 +108,11 @@ def api_root(request):
             "endpoints": {
                 "search": "/api/search/?q=<query>&mode=<mode>&per_page=<int>",
                 "modes": ["relevance", "open_access", "best_match"],
+                "openalex_authors": "/api/openalex/authors/?q=<query>",
+                "summarise": "/api/summarise/",
+                "generate_title": "/api/generate_title/",
+                "multi_paper_qa": "/api/multi-paper-qa/",
+                "performance": "/api/performance/{stats,model,compare}/",
             },
             "documentation": "https://docs.openalex.org/",
         }
@@ -89,9 +120,8 @@ def api_root(request):
 
 
 @api_view(["GET"])
-@authentication_classes([])
-@permission_classes([AllowAny])
 @throttle_classes([SearchRateThrottle])
+@handle_service_errors()
 def search(request):
     """
     Search academic papers via OpenAlex with ranking modes and pagination.
@@ -171,36 +201,12 @@ def search(request):
         )
 
     # Validate and parse year parameters
-    min_year = None
-    max_year = None
-
-    if min_year_raw is not None:
-        try:
-            min_year = int(min_year_raw)
-            if min_year < 1900 or min_year > 2026:
-                return JsonResponse(
-                    {"error": "min_year must be between 1900 and 2026"},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-        except (ValueError, TypeError):
-            return JsonResponse(
-                {"error": "min_year must be a valid integer"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-    if max_year_raw is not None:
-        try:
-            max_year = int(max_year_raw)
-            if max_year < 1900 or max_year > 2026:
-                return JsonResponse(
-                    {"error": "max_year must be between 1900 and 2026"},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-        except (ValueError, TypeError):
-            return JsonResponse(
-                {"error": "max_year must be a valid integer"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+    min_year, year_error = _parse_bounded_year(min_year_raw, "min_year")
+    if year_error:
+        return year_error
+    max_year, year_error = _parse_bounded_year(max_year_raw, "max_year")
+    if year_error:
+        return year_error
 
     if min_year is not None and max_year is not None and min_year > max_year:
         return JsonResponse(
@@ -229,10 +235,10 @@ def search(request):
 
     # Local corpus first. Only for a first page with no filters the local
     # server cannot honour. Any failure or weak result falls through to OpenAlex.
-    # The frontend always sends the full default range (1900-2026). That is not
-    # a real filter, so it must not switch the local corpus off.
-    year_filter_active = (min_year not in (None, 1900)) or (
-        max_year not in (None, 2026)
+    # The frontend always sends the full default range. That is not a real
+    # filter, so it must not switch the local corpus off.
+    year_filter_active = (min_year not in (None, DEFAULT_MIN_YEAR)) or (
+        max_year not in (None, DEFAULT_MAX_YEAR)
     )
 
     local_corpus_service = LocalCorpusService()  # reads settings per request
@@ -249,7 +255,10 @@ def search(request):
                 papers = local["papers"]
                 try:
                     QueryLog.objects.create(
-                        query_text=query, ranking_mode=mode, result_count=len(papers)
+                        query_text=query,
+                        ranking_mode=mode,
+                        result_count=len(papers),
+                        owner=request.user,
                     )
                 except Exception:
                     logger.warning("Failed to write QueryLog entry.", exc_info=True)
@@ -288,12 +297,10 @@ def search(request):
         meta = api_response.get("meta", {})
         total_count = meta.get("count", len(raw_results))
         next_cursor = meta.get("next_cursor")
+        search_type = api_response.get("search_type", "keyword")
 
     except ValueError as exc:
         return JsonResponse({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
-    except OpenAlexAPIError as exc:
-        logger.error("OpenAlex error: %s", exc)
-        return JsonResponse({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
 
     # Extract structured metadata from raw works
     papers = [ExtractionService.extract_metadata(work) for work in raw_results]
@@ -304,6 +311,7 @@ def search(request):
             query_text=query,
             ranking_mode=mode,
             result_count=len(papers),
+            owner=request.user,
         )
     except Exception:
         logger.warning("Failed to write QueryLog entry.", exc_info=True)
@@ -324,12 +332,14 @@ def search(request):
             "query": query,
             "message": message,
             "source": "openalex",
+            "search_type": search_type,
         }
     )
 
 
 @api_view(["POST"])
 @throttle_classes([GenerateTitle])
+@handle_service_errors()
 def generate_title(request):
     """
     Generate a title for a research conversation using OpenRouter LLM.
@@ -359,45 +369,38 @@ def generate_title(request):
             {"error": "Missing or invalid 'messages' field"}, status=400
         )
 
-    try:
-        # Select the configured LLM backend (see services/llm_service.py)
-        llm = get_llm()
+    # Select the configured LLM backend (see services/llm_service.py)
+    llm = get_llm()
 
-        # Convert conversation history to a single user message for title generation
-        conversation_text = "\n".join(
-            [
-                f"{msg.get('role', '').title()}: {msg.get('content', '')}"
-                for msg in messages[-5:]  # Use last 5 messages to avoid token limits
-            ]
-        )
+    # Convert conversation history to a single user message for title generation
+    conversation_text = "\n".join(
+        [
+            f"{msg.get('role', '').title()}: "
+            f"{str(msg.get('content', ''))[:TITLE_MESSAGE_MAX_CHARS]}"
+            for msg in messages[-5:]  # Use last 5 messages to avoid token limits
+        ]
+    )
 
-        # Get title from LLM
-        title = llm.complete(
-            system_prompt="You are a helpful assistant that generates concise, professional titles for research conversations.",
-            user_message=f"Based on this conversation, suggest a short, catchy, professional title (maximum 40 characters). Respond with ONLY the title text - no quotes, explanations, or extra words.\n\nConversation:\n{conversation_text}",
-            request_type="title",
-        )
+    # Get title from LLM
+    title = llm.complete(
+        system_prompt="You are a helpful assistant that generates concise, professional titles for research conversations.",
+        user_message=f"Based on this conversation, suggest a short, catchy, professional title (maximum 40 characters). Respond with ONLY the title text - no quotes, explanations, or extra words.\n\nConversation:\n{conversation_text}",
+        request_type="title",
+    )
 
-        # Clean the title
-        title = re.sub(r'^["\']|["\']$|^\s*Title:\s*', "", title).strip()
+    # Clean the title
+    title = re.sub(r'^["\']|["\']$|^\s*Title:\s*', "", title).strip()
 
-        if len(title) < 5 or len(title) > 60:
-            title = "Research Conversation"
+    if len(title) < 5 or len(title) > 60:
+        title = "Research Conversation"
 
-        return JsonResponse({"title": title})
+    return JsonResponse({"title": title})
 
-    except LLMError as exc:
-        logger.error("LLM title generation error: %s", exc)
-        return JsonResponse(
-            {"error": "Service temporarily unavailable"},
-            status=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-    except Exception as exc:
-        logger.error("Unexpected error in generate_title: %s", exc, exc_info=True)
-        return JsonResponse(
-            {"error": "Internal server error"},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        )
+
+def clerk_context():
+    """Template context for pages that need the Clerk publishable key (it is
+    public by design; the secret key is never passed to templates)."""
+    return {"clerk_publishable_key": settings.CLERK_PUBLISHABLE_KEY}
 
 
 def landing(request):
@@ -412,20 +415,14 @@ def sign_in(request):
     Render the Clerk sign-in page (Google). The publishable key is public by
     design; the secret key is never passed to templates.
     """
-    return render(
-        request,
-        "sign_in.html",
-        {"clerk_publishable_key": settings.CLERK_PUBLISHABLE_KEY},
-    )
+    return render(request, "sign_in.html", clerk_context())
 
 
 def frontend(request):
     """
     Render the frontend HTML template for the Scholara research workspace.
     """
-    return render(
-        request, "index.html", {"clerk_publishable_key": settings.CLERK_PUBLISHABLE_KEY}
-    )
+    return render(request, "index.html", clerk_context())
 
 
 def analysis(request):
@@ -441,15 +438,12 @@ def analysis(request):
     handoff (it shows a recovery path back to /workspace/, never
     fabricated sample papers).
     """
-    return render(
-        request,
-        "analysis.html",
-        {"clerk_publishable_key": settings.CLERK_PUBLISHABLE_KEY},
-    )
+    return render(request, "analysis.html", clerk_context())
 
 
 @api_view(["POST"])
 @throttle_classes([GenerateTitle])
+@handle_service_errors(include_error_code=True)
 def summarise(request):
     """
     Generate a summary of research papers using OpenRouter LLM.
@@ -482,6 +476,12 @@ def summarise(request):
     if not papers or not isinstance(papers, list):
         return JsonResponse({"error": "Missing or invalid 'papers' field"}, status=400)
 
+    if len(papers) > MAX_SUMMARY_PAPERS:
+        return JsonResponse(
+            {"error": f"At most {MAX_SUMMARY_PAPERS} papers can be summarised at once."},
+            status=400,
+        )
+
     try:
         # Select the configured LLM backend (see services/llm_service.py)
         llm = get_llm()
@@ -490,10 +490,14 @@ def summarise(request):
         user_message = build_user_message(papers, query)
 
         # Get summary from LLM
+        max_tokens = summary_max_tokens(len(papers))
+        validator = require_all_papers(len(papers))
         summary = llm.complete(
             system_prompt=system_prompt,
             user_message=user_message,
+            max_tokens=max_tokens,
             request_type="summary",
+            response_validator=validator,
         )
         try:
             summary = extract_final_summary(summary)
@@ -514,9 +518,14 @@ def summarise(request):
                     "your reasoning, use JSON, or add markdown fences."
                 ),
                 user_message=user_message,
+                max_tokens=max_tokens,
                 request_type="summary",
+                response_validator=validator,
             )
             summary = extract_final_summary(summary)
+
+        # Models (notably the Ollama VM) often leave out the References list.
+        summary = ensure_references(summary, papers)
 
         return JsonResponse({"summary": summary})
 
@@ -528,30 +537,11 @@ def summarise(request):
             },
             status=502,
         )
-    except LLMError as exc:
-        logger.error("LLM summarise error: %s", exc)
-        return JsonResponse(
-            {
-                "error": "Service temporarily unavailable",
-                "error_code": "LLM_API_ERROR",
-                "message": "Summary service temporarily unavailable - please try again later",
-            },
-            status=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
-    except Exception as exc:
-        logger.error("Unexpected error in summarise: %s", exc, exc_info=True)
-        return JsonResponse(
-            {
-                "error": "Internal server error",
-                "error_code": "INTERNAL_ERROR",
-                "message": "An unexpected error occurred",
-            },
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        )
 
 
 @api_view(["GET"])
 @throttle_classes([SearchRateThrottle])
+@handle_service_errors()
 def search_authors(request):
     """
     Search authors via OpenAlex API.
@@ -607,28 +597,20 @@ def search_authors(request):
         "Author search request: query='%s' per_page=%d page=%d", query, per_page, page
     )
 
-    try:
-        # Fetch authors from OpenAlex
-        results = openalex_service.search_authors(
-            query=query,
-            per_page=per_page,
-            page=page,
-        )
-        return JsonResponse(
-            {
-                "results": results,
-                "page": page,
-                "per_page": per_page,
-                "query": query,
-            }
-        )
-    except OpenAlexAPIError as exc:
-        logger.error("OpenAlex author search error: %s", exc)
-        return JsonResponse({"error": str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
-
-
-class MultiPaperQAThrottle(AnonRateThrottle):
-    rate = "10/m"  # PDF fetch + LLM call makes this an expensive endpoint
+    # Fetch authors from OpenAlex
+    results = openalex_service.search_authors(
+        query=query,
+        per_page=per_page,
+        page=page,
+    )
+    return JsonResponse(
+        {
+            "results": results,
+            "page": page,
+            "per_page": per_page,
+            "query": query,
+        }
+    )
 
 
 @api_view(["POST"])
@@ -695,17 +677,27 @@ def multi_paper_qa(request):
     papers_chunks = {}
     paper_errors = {}
 
-    # Chunk each paper independently so one bad PDF does not stop the rest.
-    for paper_id in paper_ids:
-        try:
-            result = QAChunkCache.get_or_chunk(pdf_urls[paper_id], paper_id)
-            papers_chunks[paper_id] = result["chunks"]
-        except QAChunkError as exc:
-            logger.warning("Chunking failed for %s: %s", paper_id, exc)
-            paper_errors[paper_id] = str(exc)
-        except Exception as exc:
-            logger.exception("Unexpected chunking error for %s", paper_id)
-            paper_errors[paper_id] = f"Unexpected error: {exc}"
+    # Chunk papers in parallel: network fetches overlap and, with OCR off,
+    # pymupdf4llm extractions run without the process-wide lock.
+    def _chunk_one(pid):
+        return pid, QAChunkCache.get_or_chunk(pdf_urls[pid], pid)
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    chunk_workers = min(settings.QA_CHUNK_WORKERS, len(paper_ids))
+    with ThreadPoolExecutor(max_workers=chunk_workers) as pool:
+        futures = {pool.submit(_chunk_one, pid): pid for pid in paper_ids}
+        for future in as_completed(futures):
+            pid = futures[future]
+            try:
+                _, result = future.result()
+                papers_chunks[pid] = result["chunks"]
+            except QAChunkError as exc:
+                logger.warning("Chunking failed for %s: %s", pid, exc)
+                paper_errors[pid] = str(exc)
+            except Exception as exc:
+                logger.exception("Unexpected chunking error for %s", pid)
+                paper_errors[pid] = f"Unexpected error: {exc}"
 
     if not papers_chunks:
         return Response(
@@ -728,6 +720,13 @@ def multi_paper_qa(request):
 
     # The LLM sees short aliases + author labels, never OpenAlex URLs.
     _, legend = build_paper_legend(validated.get("paper_meta"), papers_chunks.keys())
+
+    use_stream = request.query_params.get("stream") == "1"
+
+    if use_stream:
+        return _multi_paper_qa_stream(
+            context_chunks, question, legend, paper_errors, context_stats,
+        )
 
     try:
         llm = get_llm()
@@ -769,3 +768,72 @@ def multi_paper_qa(request):
         },
         status=status.HTTP_200_OK,
     )
+
+
+def _sse_event(event_type, data):
+    """Format a single SSE event."""
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event_type}\ndata: {payload}\n\n"
+
+
+def _multi_paper_qa_stream(context_chunks, question, legend, paper_errors, context_stats):
+    """Return a StreamingHttpResponse that sends SSE events as the LLM generates tokens."""
+
+    def event_stream():
+        # Send paper errors and context stats upfront so the UI can show them.
+        yield _sse_event("progress", {
+            "paper_errors": paper_errors,
+            "context_trimmed": context_stats["trimmed"],
+            "context_papers": context_stats["papers"],
+            "papers": {
+                pid: {"title": info["title"], "label": info["label"]}
+                for pid, info in legend.items()
+            },
+        })
+
+        try:
+            llm = get_llm()
+        except LLMError as exc:
+            logger.error("Multi-paper Q&A stream: LLM unavailable: %s", exc)
+            yield _sse_event("error", {"error": "Service temporarily unavailable"})
+            return
+
+        try:
+            for event_type, data in QACompletionService.ask_streaming(
+                llm, context_chunks, question, legend
+            ):
+                if event_type == "token":
+                    yield _sse_event("token", {"t": data})
+                elif event_type == "reset":
+                    yield _sse_event("reset", {})
+                elif event_type == "done":
+                    validated_citations = QACitationValidator.validate_citations(
+                        data["citations"], context_chunks
+                    )
+                    yield _sse_event("done", {
+                        "answer": data["answer"],
+                        "citations": validated_citations,
+                        "paper_errors": paper_errors,
+                        "context_trimmed": context_stats["trimmed"],
+                        "context_papers": context_stats["papers"],
+                        "papers": {
+                            pid: {"title": info["title"], "label": info["label"]}
+                            for pid, info in legend.items()
+                        },
+                    })
+        except QACompletionError as exc:
+            logger.error("Multi-paper Q&A stream failed: %s", exc)
+            yield _sse_event("error", {"error": f"LLM request failed: {exc}"})
+        except LLMError as exc:
+            logger.error("Multi-paper Q&A stream: LLM error: %s", exc)
+            yield _sse_event("error", {"error": "Service temporarily unavailable"})
+        except Exception as exc:
+            logger.exception("Unexpected error during Q&A stream")
+            yield _sse_event("error", {"error": f"Internal server error: {exc}"})
+
+    response = StreamingHttpResponse(
+        event_stream(), content_type="text/event-stream"
+    )
+    response["Cache-Control"] = "no-cache"
+    response["X-Accel-Buffering"] = "no"
+    return response

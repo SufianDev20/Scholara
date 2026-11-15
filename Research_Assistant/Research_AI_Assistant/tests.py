@@ -18,8 +18,8 @@ from django.test import TestCase, Client, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from .models import ModelPerformance, ModelReliability, PaperPDF, User
-from .services.llm_service import LLMError
+from .models import ModelPerformance, ModelReliability, PaperQAChunks, User
+from .services.llm_service import LLMError, STREAM_RESET
 from .services.qa_chunk_cache import CHUNK_SCHEMA_VERSION, QAChunkCache
 from .services.performance_tracker import (
     CIRCUIT_BREAKER_RESET_MIN,
@@ -33,9 +33,19 @@ from django.core.cache import cache
 from .services.openrouter_service import (
     OpenRouterService,
     OpenRouterAPIError,
+    REASONING_MODELS_CACHE_KEY,
     fetch_free_models,
+    reasoning_model_ids,
 )
-from .services.prompt_builder import system_prompt, build_user_message
+from .services.prompt_builder import (
+    InvalidSummaryFormat,
+    SUMMARY_MAX_TOKENS,
+    ensure_references,
+    require_all_papers,
+    summary_max_tokens,
+    system_prompt,
+    build_user_message,
+)
 
 
 class ClerkAuthTestMixin:
@@ -72,29 +82,208 @@ class TestOpenAlexService(TestCase):
         mock_works_class.return_value = mock_works_instance
 
         mock_search_result = Mock()
-        mock_works_instance.search.return_value = mock_search_result
+        mock_works_instance.similar.return_value = mock_search_result
 
         mock_search_result.filter.return_value = mock_search_result
 
         mock_results = [{"id": "1", "title": "Test Paper"}]
         mock_search_result.get.return_value = (
             mock_results,
-            {"count": 1, "next_cursor": "abc"},
+            {"count": 1, "next_cursor": None},
         )
 
         service = OpenAlexService()
         result = service.search_papers("machine learning")
 
+        # First page uses semantic search; Load More continues with keyword
+        # from the start of its cursor chain ("*").
         self.assertEqual(
             result,
-            {"results": mock_results, "meta": {"count": 1, "next_cursor": "abc"}},
+            {
+                "results": mock_results,
+                "meta": {"count": 1, "next_cursor": "*"},
+                "search_type": "semantic",
+            },
         )
         mock_works_class.assert_called_once()
-        mock_works_instance.search.assert_called_once_with("machine learning")
+        mock_works_instance.similar.assert_called_once_with("machine learning")
+        mock_works_instance.search.assert_not_called()
         mock_search_result.filter.assert_called_once_with(is_retracted=False)
-        mock_search_result.get.assert_called_once_with(
-            return_meta=True, per_page=25, cursor="*"
+        mock_search_result.get.assert_called_once_with(return_meta=True, per_page=25)
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_semantic_empty_falls_back_to_keyword(self, mock_works_class):
+        """Zero semantic hits fall back to keyword search."""
+        mock_works_instance = Mock()
+        mock_works_class.return_value = mock_works_instance
+
+        semantic = Mock()
+        semantic.filter.return_value = semantic
+        semantic.get.return_value = ([], {"count": 0, "next_cursor": None})
+        keyword = Mock()
+        keyword.filter.return_value = keyword
+        keyword_results = [{"id": "9"}]
+        keyword.get.return_value = (keyword_results, {"count": 1, "next_cursor": "k2"})
+        mock_works_instance.similar.return_value = semantic
+        mock_works_instance.search.return_value = keyword
+
+        result = OpenAlexService().search_papers("odd query", per_page=10)
+
+        self.assertEqual(result["search_type"], "keyword")
+        self.assertEqual(result["results"], keyword_results)
+        self.assertEqual(result["meta"]["next_cursor"], "k2")
+        keyword.get.assert_called_once_with(return_meta=True, per_page=10, cursor="*")
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_semantic_error_falls_back_to_keyword(self, mock_works_class):
+        """A semantic API failure falls back to keyword search."""
+        mock_works_instance = Mock()
+        mock_works_class.return_value = mock_works_instance
+
+        semantic = Mock()
+        semantic.filter.return_value = semantic
+        semantic.get.side_effect = Exception("semantic down")
+        keyword = Mock()
+        keyword.filter.return_value = keyword
+        keyword.get.return_value = ([{"id": "5"}], {"count": 1, "next_cursor": None})
+        mock_works_instance.similar.return_value = semantic
+        mock_works_instance.search.return_value = keyword
+
+        result = OpenAlexService().search_papers("query")
+
+        self.assertEqual(result["search_type"], "keyword")
+        self.assertEqual(result["results"], [{"id": "5"}])
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_cursor_request_uses_keyword(self, mock_works_class):
+        """Load More (cursor set) never uses semantic search."""
+        mock_works_instance = Mock()
+        mock_works_class.return_value = mock_works_instance
+        keyword = Mock()
+        keyword.filter.return_value = keyword
+        keyword.get.return_value = ([{"id": "7"}], {"count": 1, "next_cursor": "n"})
+        mock_works_instance.search.return_value = keyword
+
+        result = OpenAlexService().search_papers("query", cursor="*")
+
+        mock_works_instance.similar.assert_not_called()
+        self.assertEqual(result["search_type"], "keyword")
+
+    def _semantic_keyword_mocks(self, mock_works_class, sem_results, kw_results=None):
+        works = Mock()
+        mock_works_class.return_value = works
+        semantic = Mock()
+        semantic.filter.return_value = semantic
+        semantic.get.return_value = (sem_results, {"count": 999, "next_cursor": None})
+        keyword = Mock()
+        keyword.filter.return_value = keyword
+        keyword.get.return_value = (
+            kw_results or [],
+            {"count": 42, "next_cursor": "kw2"},
         )
+        works.similar.return_value = semantic
+        works.search.return_value = keyword
+        return semantic, keyword
+
+    @staticmethod
+    def _filter_kwargs(mock_query):
+        return [c.kwargs for c in mock_query.filter.call_args_list]
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_default_year_range_is_not_a_filter(self, mock_works_class):
+        """Frontend default 1900-2026 must stay on plain semantic search."""
+        semantic, keyword = self._semantic_keyword_mocks(mock_works_class, [{"id": "1"}])
+
+        result = OpenAlexService().search_papers("q", min_year=1900, max_year=2026)
+
+        self.assertEqual(result["search_type"], "semantic")
+        self.assertEqual(self._filter_kwargs(semantic), [{"is_retracted": False}])
+        keyword.get.assert_not_called()
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_exact_year_uses_publication_year_on_semantic(self, mock_works_class):
+        semantic, keyword = self._semantic_keyword_mocks(mock_works_class, [{"id": "1"}])
+
+        result = OpenAlexService().search_papers("q", min_year=2023, max_year=2023)
+
+        self.assertEqual(result["search_type"], "semantic")
+        kwargs = self._filter_kwargs(semantic)
+        self.assertIn({"publication_year": 2023}, kwargs)
+        for k in kwargs:
+            self.assertNotIn("from_publication_date", k)
+            self.assertNotIn("to_publication_date", k)
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_year_range_post_filters_semantic_pool(self, mock_works_class):
+        pool = [{"id": str(y), "publication_year": y} for y in (2010, 2021, 2022, 2030)]
+        semantic, keyword = self._semantic_keyword_mocks(mock_works_class, pool)
+
+        result = OpenAlexService().search_papers(
+            "q", per_page=2, min_year=2020, max_year=2024
+        )
+
+        self.assertEqual(result["search_type"], "semantic")
+        self.assertEqual([w["id"] for w in result["results"]], ["2021", "2022"])
+        self.assertEqual(result["meta"]["count"], 2)
+        for k in self._filter_kwargs(semantic):
+            self.assertNotIn("from_publication_date", k)
+            self.assertNotIn("to_publication_date", k)
+        keyword.get.assert_not_called()
+        semantic.get.assert_called_once_with(return_meta=True, per_page=50)
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_thin_semantic_pool_is_topped_up_from_keyword(self, mock_works_class):
+        pool = [{"id": "a", "publication_year": 2021}]
+        kw = [
+            {"id": "a", "publication_year": 2021},
+            {"id": "b", "publication_year": 2022},
+            {"id": "c", "publication_year": 2023},
+        ]
+        semantic, keyword = self._semantic_keyword_mocks(mock_works_class, pool, kw)
+
+        result = OpenAlexService().search_papers(
+            "q", per_page=3, min_year=2020, max_year=2024
+        )
+
+        self.assertEqual(result["search_type"], "hybrid")
+        self.assertEqual([w["id"] for w in result["results"]], ["a", "b", "c"])
+        # next_cursor is "*", not the keyword page-2 cursor: Load More re-runs
+        # keyword from the start and the frontend de-dupes, so keyword page-1
+        # papers not used as top-up are not lost.
+        self.assertEqual(result["meta"], {"count": 42, "next_cursor": "*"})
+        kw_kwargs = self._filter_kwargs(keyword)
+        self.assertIn({"from_publication_date": "2020-01-01"}, kw_kwargs)
+        self.assertIn({"to_publication_date": "2024-12-31"}, kw_kwargs)
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_oa_status_filtered_client_side_on_semantic(self, mock_works_class):
+        pool = [
+            {"id": "g", "open_access": {"oa_status": "gold"}},
+            {"id": "b", "open_access": {"oa_status": "bronze"}},
+            {"id": "n", "open_access": None},
+        ]
+        semantic, keyword = self._semantic_keyword_mocks(mock_works_class, pool)
+
+        result = OpenAlexService().search_papers("q", per_page=1, oa_status="gold")
+
+        self.assertEqual(result["search_type"], "semantic")
+        self.assertEqual([w["id"] for w in result["results"]], ["g"])
+        for k in self._filter_kwargs(semantic):
+            self.assertNotIn("oa_status", k)
+
+    @patch("Research_AI_Assistant.services.openalex_service.Works")
+    def test_post_filter_empty_falls_back_to_keyword(self, mock_works_class):
+        pool = [{"id": "x", "publication_year": 1990}]
+        kw = [{"id": "k", "publication_year": 2021}]
+        semantic, keyword = self._semantic_keyword_mocks(mock_works_class, pool, kw)
+
+        result = OpenAlexService().search_papers(
+            "q", per_page=5, min_year=2020, max_year=2024
+        )
+
+        self.assertEqual(result["search_type"], "keyword")
+        self.assertEqual(result["results"], kw)
+        keyword.get.assert_called_once_with(return_meta=True, per_page=5, cursor="*")
 
     @patch("Research_AI_Assistant.services.openalex_service.Works")
     def test_search_papers_with_filters(self, mock_works_class):
@@ -408,39 +597,11 @@ class TestExtractionService(TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Full text URL and author search tests
+# Author search tests
 # ---------------------------------------------------------------------------
 
 
-class TestExtractFullTextUrl(TestCase):
-    """Test cases for _extract_full_text_url method."""
-
-    def test_extract_full_text_url_from_best_oa(self):
-        """Test extracting URL from best_oa_location."""
-        mock_work = {
-            "best_oa_location": {"pdf_url": "https://oa.example.com/paper.pdf"}
-        }
-
-        url = ExtractionService._extract_full_text_url(mock_work)
-
-        self.assertEqual(url, "https://oa.example.com/paper.pdf")
-
-    def test_extract_full_text_url_from_content_urls(self):
-        """Test extracting URL from content_urls when best_oa not available."""
-        mock_work = {"content_urls": {"pdf": "https://content.example.com/paper.pdf"}}
-
-        url = ExtractionService._extract_full_text_url(mock_work)
-
-        self.assertEqual(url, "https://content.example.com/paper.pdf")
-
-    def test_extract_full_text_url_none(self):
-        """Test returning None when no full text URL available."""
-        mock_work = {}
-
-        url = ExtractionService._extract_full_text_url(mock_work)
-
-        self.assertIsNone(url)
-
+class TestSearchAuthors(TestCase):
     @patch("Research_AI_Assistant.services.openalex_service.Authors")
     def test_search_authors_success(self, mock_authors_class):
         """Ensure author search produces expected results."""
@@ -975,14 +1136,11 @@ class TestSummariseView(ClerkAuthTestMixin, TestCase):
         self.assertEqual(resp.status_code, 503)
 
     @patch("Research_AI_Assistant.views.get_llm")
-    def test_summarise_passes_all_papers_uncapped(self, mock_service_class):
+    def test_summarise_passes_all_papers_under_the_cap(self, mock_service_class):
         """
-        The view currently passes every paper straight to build_user_message
-        with no cap (unlike multi_paper_qa's QARequestSerializer, which caps
-        paper_ids at 10). Flagged to the user as an input-size gap worth a
-        cap, separate from the ponytail-audit scope this test suite was
-        otherwise fixed under; this test documents the current behavior
-        rather than a requirement.
+        Every paper under the cap (views.MAX_SUMMARY_PAPERS) is passed to
+        build_user_message; none are silently dropped. The cap itself is
+        covered by TestLLMInputCaps.
         """
         mock_instance = MagicMock()
         mock_instance.complete.return_value = MOCK_SUMMARY
@@ -1123,6 +1281,212 @@ class TestFetchFreeModels(TestCase):
         self.assertNotIn("a/image-model:free", models)
         self.assertIn("b/chat-model:free", models)
 
+    @patch("Research_AI_Assistant.services.openrouter_service.requests.get")
+    def test_records_reasoning_models(self, mock_get):
+        """A `reasoning` object or a reasoning entry in supported_parameters
+        marks the model as reasoning; a model with neither is not."""
+        mock_get.return_value = MagicMock(
+            json=lambda: {
+                "data": [
+                    {"id": "a/thinker:free", "reasoning": {"mandatory": True}},
+                    {
+                        "id": "b/hybrid:free",
+                        "supported_parameters": ["max_tokens", "reasoning"],
+                    },
+                    {"id": "c/plain:free", "supported_parameters": ["max_tokens"]},
+                ]
+            }
+        )
+        fetch_free_models()
+        self.assertEqual(
+            reasoning_model_ids(), {"a/thinker:free", "b/hybrid:free"}
+        )
+
+
+def _empty_choices_response():
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {"choices": []}
+    return response
+
+
+@override_settings(
+    OPENROUTER_API_KEY="test-key-123",
+    OPENROUTER_MODELS=[
+        "r/one:free", "n/one:free", "r/two:free",
+        "n/two:free", "n/three:free", "n/four:free",
+    ],
+    OPENROUTER_QA_MAX_MODELS=4,
+    OPENROUTER_QA_DEADLINE_SECONDS=90,
+    OPENROUTER_TIMEOUT_SECONDS=60,
+)
+@patch(
+    "Research_AI_Assistant.services.openrouter_service.PerformanceTracker."
+    "get_intelligent_model_order",
+    side_effect=lambda models: list(models),
+)
+class TestOpenRouterQALimits(TestCase):
+    """Q&A tries non-reasoning models first, caps the attempts, and stops
+    walking the chain at a total deadline."""
+
+    def setUp(self):
+        cache.clear()
+        cache.set(REASONING_MODELS_CACHE_KEY, ["r/one:free", "r/two:free"])
+
+    def _posted_models(self, mock_post):
+        return [c.kwargs["json"]["model"] for c in mock_post.call_args_list]
+
+    @patch("Research_AI_Assistant.services.openrouter_service.requests.post")
+    def test_qa_tries_non_reasoning_first_and_caps_attempts(self, mock_post, _order):
+        mock_post.return_value = _empty_choices_response()
+        with self.assertRaises(OpenRouterAPIError):
+            OpenRouterService().complete("s", "u", request_type="qa")
+        self.assertEqual(
+            self._posted_models(mock_post),
+            ["n/one:free", "n/two:free", "n/three:free", "n/four:free"],
+        )
+
+    @patch("Research_AI_Assistant.services.openrouter_service.requests.post")
+    def test_non_qa_order_and_cap_unchanged(self, mock_post, _order):
+        mock_post.return_value = _empty_choices_response()
+        with self.assertRaises(OpenRouterAPIError):
+            OpenRouterService().complete("s", "u", request_type="summary")
+        self.assertEqual(
+            self._posted_models(mock_post),
+            ["r/one:free", "n/one:free", "r/two:free",
+             "n/two:free", "n/three:free", "n/four:free"],
+        )
+
+    @patch("Research_AI_Assistant.services.openrouter_service.time")
+    @patch("Research_AI_Assistant.services.openrouter_service.requests.post")
+    def test_qa_stops_at_deadline(self, mock_post, mock_time, _order):
+        # Deadline set at t=0 (so 90); attempt 1 starts at t=0; by attempt 2
+        # it is t=88, leaving less than MIN_ATTEMPT_SECONDS.
+        mock_time.monotonic.side_effect = [0, 0, 88]
+        mock_post.return_value = _empty_choices_response()
+        with self.assertRaises(OpenRouterAPIError) as cm:
+            OpenRouterService().complete("s", "u", request_type="qa")
+        self.assertEqual(mock_post.call_count, 1)
+        self.assertIn("time limit", str(cm.exception))
+        # The single attempt's HTTP timeout was capped by the time left.
+        self.assertEqual(mock_post.call_args.kwargs["timeout"], 60)
+
+    @patch("Research_AI_Assistant.services.openrouter_service.time")
+    @patch("Research_AI_Assistant.services.openrouter_service.requests.post")
+    def test_qa_stream_stops_mid_stream_at_deadline(self, mock_post, mock_time, _order):
+        chunk = 'data: {"choices":[{"delta":{"content":"tok"}}]}'
+        response = MagicMock()
+        response.iter_lines.return_value = iter([chunk, chunk, chunk])
+        mock_post.return_value = response
+        # deadline=90; attempt start t=0; first line t=10; second line t=95.
+        mock_time.monotonic.side_effect = [0, 0, 10, 95]
+
+        tokens = []
+        with self.assertRaises(OpenRouterAPIError) as cm:
+            for token in OpenRouterService().stream_complete(
+                "s", "u", request_type="qa"
+            ):
+                tokens.append(token)
+        self.assertEqual(tokens, ["tok"])
+        self.assertEqual(mock_post.call_count, 1)
+        response.close.assert_called_once()
+        self.assertIn("time limit", str(cm.exception))
+
+
+def _sse_response(*contents):
+    """A streamed chat-completion response whose deltas are `contents`."""
+    lines = [
+        "data: " + json.dumps({"choices": [{"delta": {"content": c}}]})
+        for c in contents
+    ] + ["data: [DONE]"]
+    response = MagicMock()
+    response.iter_lines.return_value = iter(lines)
+    return response
+
+
+def _reject_unless_valid_json(content):
+    json.loads(content)
+
+
+@override_settings(
+    OPENROUTER_API_KEY="test-key-123",
+    OPENROUTER_MODELS=["a/first:free", "b/second:free"],
+)
+@patch(
+    "Research_AI_Assistant.services.openrouter_service.PerformanceTracker."
+    "get_intelligent_model_order",
+    side_effect=lambda models: list(models),
+)
+class TestOpenRouterStreamReset(TestCase):
+    """When stream_complete falls through to another model after tokens
+    were already yielded, it yields STREAM_RESET before the next model's."""
+
+    def _stream(self):
+        return list(OpenRouterService().stream_complete(
+            "s", "u", request_type="qa",
+            response_validator=_reject_unless_valid_json,
+        ))
+
+    @patch("Research_AI_Assistant.services.openrouter_service.requests.post")
+    def test_reset_between_a_failed_partial_stream_and_the_next_model(
+        self, mock_post, _order
+    ):
+        mock_post.side_effect = [
+            _sse_response('{"answer": "cut off'),
+            _sse_response('{"answer": "ok"}'),
+        ]
+        self.assertEqual(
+            self._stream(), ['{"answer": "cut off', STREAM_RESET, '{"answer": "ok"}']
+        )
+
+    @patch("Research_AI_Assistant.services.openrouter_service.requests.post")
+    def test_no_reset_when_the_failed_model_sent_nothing(self, mock_post, _order):
+        import requests as req_lib
+
+        failed = MagicMock()
+        failed.raise_for_status.side_effect = req_lib.exceptions.HTTPError(
+            "429 Too Many Requests", response=MagicMock(status_code=429)
+        )
+        mock_post.side_effect = [failed, _sse_response('{"answer": "ok"}')]
+        self.assertEqual(self._stream(), ['{"answer": "ok"}'])
+
+
+class TestSummaryCompleteness(TestCase):
+    """A summary cut off before its References list must not be accepted,
+    and the token budget grows with the number of papers."""
+
+    COMPLETE = (
+        "Paper 1: Title\nAuthors: Smith, J.\nYear: 2022\nSummary: A result.\n"
+        "References:\nSmith, J. (2022) Title. Journal."
+    )
+    CUT_OFF = "Paper 1: Title\nAuthors: Smith, J.\nYear: 2022\nSummary: A res"
+
+    PAPERS = [{
+        "title": "Title", "publication_year": 2022, "source": "Journal",
+        "doi": "10.1/x", "authors": [{"name": "Jane Smith"}],
+    }]
+
+    def test_complete_summary_is_accepted(self):
+        require_all_papers(1)(self.COMPLETE)
+
+    def test_summary_missing_a_paper_is_rejected(self):
+        with self.assertRaises(InvalidSummaryFormat):
+            require_all_papers(2)(self.COMPLETE)
+
+    def test_missing_references_are_built_from_metadata(self):
+        no_refs = self.COMPLETE.split("References:")[0].strip()
+        out = ensure_references(no_refs, self.PAPERS)
+        self.assertIn(
+            "References:\n[1] Smith, J. (2022) 'Title'. Journal. doi: 10.1/x.", out
+        )
+
+    def test_existing_references_are_left_alone(self):
+        self.assertEqual(ensure_references(self.COMPLETE, self.PAPERS), self.COMPLETE)
+
+    def test_budget_grows_with_papers_and_is_capped(self):
+        self.assertLess(summary_max_tokens(1), summary_max_tokens(5))
+        self.assertEqual(summary_max_tokens(50), SUMMARY_MAX_TOKENS)
+
 
 # ---------------------------------------------------------------------------
 # Circuit breaker tests
@@ -1238,22 +1602,20 @@ class TestCircuitBreaker(TestCase):
         # log_request_failure only evaluates the threshold on an existing row.
         ModelPerformance.objects.create(model_name="flaky:free")
 
-        PerformanceTracker.log_request_failure(
-            "flaky:free", "req-1", "summary", 1.0, "boom"
-        )
+        PerformanceTracker.log_request_failure("flaky:free", "summary", 1.0, "boom")
         perf = ModelPerformance.objects.get(model_name="flaky:free")
         self.assertEqual(perf.consecutive_failures, 1)
         self.assertTrue(perf.is_active, "one failure must not trip the breaker")
 
         PerformanceTracker.log_request_failure(
-            "flaky:free", "req-2", "summary", 1.0, "boom again"
+            "flaky:free", "summary", 1.0, "boom again"
         )
         perf.refresh_from_db()
         self.assertEqual(perf.consecutive_failures, 2)
         self.assertFalse(perf.is_active)
 
         PerformanceTracker.log_request_success(
-            "flaky:free", "req-3", "summary", 1.0, COMPLIANT_SUMMARY
+            "flaky:free", "summary", 1.0, COMPLIANT_SUMMARY
         )
         perf.refresh_from_db()
         self.assertTrue(perf.is_active)
@@ -1263,8 +1625,18 @@ class TestCircuitBreaker(TestCase):
         OPENROUTER_API_KEY="test-key-123", OPENROUTER_MODELS=["m/one:free"]
     )
     @patch("Research_AI_Assistant.services.openrouter_service.requests.post")
-    def test_complete_resets_breaker_before_ordering(self, mock_post):
-        """complete() must retry disabled models before it ranks them."""
+    def test_complete_retries_recovered_model_in_the_same_call(self, mock_post):
+        """A model disabled long enough ago to clear the reset window must be
+        usable again within the very call that triggers the reset, not just
+        on a later request."""
+        ModelReliability.objects.create(model_name="m/one:free", tier="primary")
+        ModelPerformance.objects.create(
+            model_name="m/one:free",
+            is_active=False,
+            consecutive_failures=5,
+            last_failure=timezone.now()
+            - timedelta(minutes=CIRCUIT_BREAKER_RESET_MIN + 5),
+        )
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
@@ -1272,27 +1644,13 @@ class TestCircuitBreaker(TestCase):
         }
         mock_post.return_value = mock_response
 
-        manager = Mock()
-        with patch.object(
-            PerformanceTracker, "reset_circuit_breaker"
-        ) as mock_reset, patch.object(
-            PerformanceTracker,
-            "get_intelligent_model_order",
-            return_value=["m/one:free"],
-        ) as mock_order:
-            manager.attach_mock(mock_reset, "reset_circuit_breaker")
-            manager.attach_mock(mock_order, "get_intelligent_model_order")
+        service = OpenRouterService()
+        result = service.complete(system_prompt="s", user_message="u")
 
-            service = OpenRouterService()
-            self.assertEqual(service.complete(system_prompt="s", user_message="u"), "ok")
-
-        called = [name for name, _args, _kwargs in manager.mock_calls]
-        self.assertIn("reset_circuit_breaker", called)
-        self.assertIn("get_intelligent_model_order", called)
-        self.assertLess(
-            called.index("reset_circuit_breaker"),
-            called.index("get_intelligent_model_order"),
-        )
+        self.assertEqual(result, "ok")
+        mock_post.assert_called_once()  # recovered model was actually tried, not skipped
+        perf = ModelPerformance.objects.get(model_name="m/one:free")
+        self.assertTrue(perf.is_active)
 
 
 # ---------------------------------------------------------------------------
@@ -1306,10 +1664,8 @@ class TestQAChunkCache(TestCase):
     the cached text belongs to it."""
 
     def test_cache_hit_served_when_source_matches(self):
-        PaperPDF.objects.create(
+        PaperQAChunks.objects.create(
             openalex_id="W1",
-            pdf_url="https://good.test/a.pdf",
-            markdown_content="",
             qa_chunks=[{"paper_id": "W1", "page": 1, "text": "hello"}],
             qa_chunk_version=CHUNK_SCHEMA_VERSION,
             qa_source_pdf_url="https://good.test/a.pdf",
@@ -1324,10 +1680,8 @@ class TestQAChunkCache(TestCase):
     def test_cache_hit_rejected_when_source_does_not_match(self):
         """A cached row built from a different URL must not be trusted for
         a request that never sent that URL for this paper_id."""
-        PaperPDF.objects.create(
+        PaperQAChunks.objects.create(
             openalex_id="W1",
-            pdf_url="https://attacker.test/fake.pdf",
-            markdown_content="",
             qa_chunks=[{"paper_id": "W1", "page": 1, "text": "poisoned"}],
             qa_chunk_version=CHUNK_SCHEMA_VERSION,
             qa_source_pdf_url="https://attacker.test/fake.pdf",
@@ -1412,3 +1766,149 @@ class TestMultiPaperQALLMError(ClerkAuthTestMixin, TestCase):
         mock_get_llm.side_effect = LLMError("Invalid LLM_BACKEND 'bogus'.")
         resp = self._post()
         self.assertEqual(resp.status_code, 503)
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting for signed-in users
+# ---------------------------------------------------------------------------
+
+
+@override_settings(RESEARCH_API_URL="", RESEARCH_API_KEY="")
+class TestSignedInUserThrottling(ClerkAuthTestMixin, TestCase):
+    """Every API view except api_root requires sign-in, so the per-view rate
+    limits must count signed-in users. (They used to subclass
+    AnonRateThrottle, which DRF skips for any authenticated request.)"""
+
+    def _title(self):
+        return self.client.post(
+            reverse("research_ai_assistant:generate_title"),
+            data=json.dumps({"messages": [{"role": "user", "content": "hi"}]}),
+            content_type="application/json",
+        )
+
+    def _mock_llm(self):
+        patcher = patch("Research_AI_Assistant.views.get_llm")
+        mock_get_llm = patcher.start()
+        self.addCleanup(patcher.stop)
+        mock_get_llm.return_value.complete.return_value = "A Research Title"
+        return mock_get_llm.return_value
+
+    def test_generate_title_is_limited_to_20_per_minute(self):
+        self._mock_llm()
+        statuses = [self._title().status_code for _ in range(21)]
+        self.assertEqual(statuses, [200] * 20 + [429])
+
+    def test_summarise_shares_the_llm_limit_with_generate_title(self):
+        self._mock_llm()
+        for _ in range(20):
+            self._title()
+        resp = self.client.post(
+            reverse("research_ai_assistant:summarise"),
+            data=json.dumps({"query": "q", "papers": MOCK_PAPERS}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 429)
+
+    def test_limit_is_counted_per_user(self):
+        self._mock_llm()
+        for _ in range(21):
+            self._title()
+        other_user = User.objects.create(clerk_id="other-clerk-id")
+        with patch(
+            "Research_AI_Assistant.authentication.ClerkAuthentication.authenticate",
+            return_value=(other_user, None),
+        ):
+            self.assertEqual(self._title().status_code, 200)
+
+    def test_multi_paper_qa_is_limited_to_10_per_minute(self):
+        from .services.qa_pipeline import QAChunkError
+
+        body = json.dumps(
+            {
+                "paper_ids": ["W1"],
+                "question": "q",
+                "pdf_urls": {"W1": "https://example.test/a.pdf"},
+            }
+        )
+        with patch(
+            "Research_AI_Assistant.views.QAChunkCache.get_or_chunk",
+            side_effect=QAChunkError("blocked"),
+        ):
+            statuses = [
+                self.client.post(
+                    reverse("research_ai_assistant:multi_paper_qa"),
+                    data=body,
+                    content_type="application/json",
+                ).status_code
+                for _ in range(11)
+            ]
+        self.assertEqual(statuses, [422] * 10 + [429])
+
+    @patch("Research_AI_Assistant.views.openalex_service.search_papers")
+    def test_search_is_limited_to_60_per_minute(self, mock_search):
+        mock_search.return_value = {"results": [], "meta": {}}
+        url = reverse("research_ai_assistant:search")
+        statuses = [self.client.get(url, {"q": "x"}).status_code for _ in range(61)]
+        self.assertEqual(statuses, [200] * 60 + [429])
+
+    def test_performance_api_is_limited_to_60_per_minute(self):
+        self._test_user.is_staff = True
+        self._test_user.save()
+        url = reverse("research_ai_assistant:performance_stats")
+        statuses = [self.client.get(url).status_code for _ in range(61)]
+        self.assertEqual(statuses, [200] * 60 + [429])
+
+    def test_per_view_counters_are_shared_between_worker_processes(self):
+        """A per-process cache would multiply every limit by the number of
+        gunicorn workers, so the counters live in the database."""
+        from django.core.cache.backends.db import DatabaseCache
+
+        from . import views
+
+        for throttle in (
+            views.SearchRateThrottle,
+            views.GenerateTitle,
+            views.MultiPaperQAThrottle,
+        ):
+            self.assertIsInstance(throttle.cache, DatabaseCache, throttle.__name__)
+
+
+class TestLLMInputCaps(ClerkAuthTestMixin, TestCase):
+    """summarise and generate_title forward client text to the LLM, so the
+    amount they forward is bounded."""
+
+    @patch("Research_AI_Assistant.views.get_llm")
+    def test_summarise_rejects_more_than_50_papers(self, mock_get_llm):
+        resp = self.client.post(
+            reverse("research_ai_assistant:summarise"),
+            data=json.dumps({"query": "q", "papers": [MOCK_PAPERS[0]] * 51}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("50", resp.json()["error"])
+        mock_get_llm.return_value.complete.assert_not_called()
+
+    @patch("Research_AI_Assistant.views.get_llm")
+    def test_summarise_accepts_50_papers(self, mock_get_llm):
+        mock_get_llm.return_value.complete.return_value = MOCK_SUMMARY
+        resp = self.client.post(
+            reverse("research_ai_assistant:summarise"),
+            data=json.dumps({"query": "q", "papers": [MOCK_PAPERS[0]] * 50}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    @patch("Research_AI_Assistant.views.get_llm")
+    def test_generate_title_truncates_long_messages(self, mock_get_llm):
+        """Binder messages hold whole summaries; a title only needs the gist,
+        so each message is cut to 2000 characters rather than rejected."""
+        mock_get_llm.return_value.complete.return_value = "A Research Title"
+        messages = [{"role": "user", "content": "§" * 10_000}] * 5
+        resp = self.client.post(
+            reverse("research_ai_assistant:generate_title"),
+            data=json.dumps({"messages": messages}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        sent = mock_get_llm.return_value.complete.call_args[1]["user_message"]
+        self.assertEqual(sent.count("§"), 5 * 2000)

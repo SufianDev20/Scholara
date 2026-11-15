@@ -1,4 +1,5 @@
 import { DOMManager } from './core.js';
+import { MAX_ANALYZABLE_PAPERS, YEAR_MAX } from './constants.js';
 
 // Extend DOMManager prototype with research-related methods
 
@@ -39,8 +40,7 @@ DOMManager.prototype.handleFollowUpQuestion = function() {
   const question = input ? input.value.trim() : "";
 
   // No navigation for an empty submission, and nothing to carry over
-  // without an active research session (matches handleResearchMessage's
-  // own guard above).
+  // without an active research session.
   if (!question || !window.appState.currentResearchBinder) return;
 
   const binder = window.appState.currentResearchBinder;
@@ -48,7 +48,7 @@ DOMManager.prototype.handleFollowUpQuestion = function() {
 
   const selectedIds = papers
     .filter((p) => p && (p.pdf_url || p.oa_url))
-    .slice(0, 10)
+    .slice(0, MAX_ANALYZABLE_PAPERS)
     .map((p) => p.openalex_id);
 
   if (!writeAnalysisSession({ binder, question, papers, selectedIds })) return;
@@ -100,26 +100,19 @@ DOMManager.prototype.renderReferences = function(papers) {
       card.tabIndex = 0;
       card.title = "Open in Paper Analysis";
 
-      // OpenAlex returns doi as a full https://doi.org/... URL; only bare
-      // DOIs need the resolver prefix.
-      var doiUrl =
-        paper && paper.doi
-          ? /^https?:\/\//i.test(paper.doi)
-            ? paper.doi
-            : "https://doi.org/" + paper.doi
-          : "";
+      // Paper metadata is untrusted text: escape every value before innerHTML.
+      var doiUrl = this.paperDoiUrl(paper && paper.doi);
+      var title = this.escapeHtml((paper && paper.title) || "Untitled");
 
       var linkHtml = doiUrl
         ? '<a class="source-link" href="' +
-          doiUrl +
+          this.escapeHtml(doiUrl) +
           '" target="_blank" rel="noopener noreferrer">' +
-          (paper.title || "Untitled") +
+          title +
           "</a>"
-        : paper && paper.title
-          ? paper.title
-          : "Untitled";
+        : title;
 
-      var citationCount = paper.cited_by_count || 0;
+      var citationCount = Number(paper.cited_by_count) || 0;
       var meta = [paper.publication_year, paper.source]
         .filter(Boolean)
         .map((v) => this.escapeHtml(String(v)))
@@ -237,7 +230,7 @@ DOMManager.prototype.generateResearchResponse = async function() {
     const maxYear =
       this.elements.yearMax?.value ||
       this.elements.yearFilter?.value ||
-      "2026";
+      String(YEAR_MAX);
     const sortPref = this.elements.searchBy?.value || "best_match";
     const maxPapers = parseInt(this.elements.quota?.value || "5");
 
@@ -315,6 +308,7 @@ DOMManager.prototype.generateResearchResponse = async function() {
 
     // Replace the "Generating response..." placeholder with the actual response
     assistantDiv.innerHTML = this.markdownToHtml(summary);
+    this.addPaperDetails(assistantDiv, papersToUse);
     assistantDiv.style.opacity = "1";
 
     // Update UI with pagination info after response + papers are rendered
@@ -395,7 +389,12 @@ DOMManager.prototype.loadMorePapers = async function() {
   }
 
   try {
-    const perPage = window.appState.searchParams?.perPage || 25;
+    // Quota filter = number of NEW papers each Load More must add. Load More is
+    // keyword search (semantic search can't paginate), so its order can repeat
+    // papers already shown from the semantic first page; over-fetch (API max 50),
+    // then drop shown ids and trim back to the quota below.
+    const quota = window.appState.searchParams?.perPage || 25;
+    const perPage = Math.min(quota * 2, 50);
     let yearParams = "";
     if (window.appState.searchParams && window.appState.searchParams.minYear) {
       yearParams += `&min_year=${encodeURIComponent(window.appState.searchParams.minYear)}`;
@@ -425,6 +424,14 @@ DOMManager.prototype.loadMorePapers = async function() {
 
     // Update cursor for next load
     window.appState.nextCursor = data.next_cursor;
+
+    // Drop papers already shown, then trim to the quota filter
+    const shownIds = new Set(
+      window.appState.currentResearchBinder.papers.map((p) => p.openalex_id),
+    );
+    data.papers = (data.papers || [])
+      .filter((p) => !shownIds.has(p.openalex_id))
+      .slice(0, quota);
 
     // Append new papers to the main papers array
     window.appState.currentResearchBinder.papers.push(...data.papers);
@@ -485,6 +492,7 @@ DOMManager.prototype.loadMorePapers = async function() {
         this.elements.researchChatContainer,
       );
       summaryDiv.innerHTML = this.markdownToHtml(summary);
+      this.addPaperDetails(summaryDiv, data.papers);
       summaryDiv.style.opacity = "1";
 
       // Also add summary to messages array for persistence
@@ -564,6 +572,7 @@ DOMManager.prototype.loadMorePapers = async function() {
                 this.elements.researchChatContainer,
               );
               summaryDiv.innerHTML = this.markdownToHtml(summary);
+              this.addPaperDetails(summaryDiv, data.papers);
               summaryDiv.style.opacity = "1";
             } else {
               throw new Error("Retry failed");
@@ -683,22 +692,4 @@ DOMManager.prototype.updatePaginationInfo = function() {
       this.elements.loadMoreContainer.style.display = "none";
     }
   }
-};
-
-DOMManager.prototype.renderAdditionalPapers = function(papers) {
-  if (!papers?.length) return;
-
-  // Create a new separate papers section for loaded more papers
-  const papersContainer = document.createElement("div");
-  papersContainer.className = "papers-grid mt-4 mb-4";
-  papersContainer.innerHTML =
-    '<div class="papers-grid-title mb-3">ADDITIONAL PAPERS</div>';
-
-  papers.forEach((paper, i) => {
-    const paperCard = this.createPaperCard(paper, i);
-    papersContainer.appendChild(paperCard);
-  });
-
-  // Add the new section to the chat container
-  this.elements.researchChatContainer.appendChild(papersContainer);
 };
