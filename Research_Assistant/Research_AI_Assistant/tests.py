@@ -36,7 +36,9 @@ from .services.performance_tracker import (
 )
 
 from .services.openalex_service import OpenAlexService, OpenAlexAPIError
-from .services.kg_mapper import EDGE_VOCAB, short_id, work_to_graph
+from .services import kg_ingest_service
+from .services.kg_ingest_service import KGIngestError, KGIngestService
+from .services.kg_mapper import EDGE_VOCAB, EdgeSpec, short_id, work_to_graph
 from .services.extract_service import ExtractionService
 from django.core.cache import cache
 
@@ -2154,3 +2156,148 @@ class TestKGMapper(TestCase):
         nodes, edges = work_to_graph(work)
         self.assertEqual(len(nodes), 1)
         self.assertEqual(edges, [])
+
+
+def _kg_work(key, year, refs=(), authors=(), venue=None):
+    return {
+        "id": OA + key,
+        "title": f"Paper {key}",
+        "publication_year": year,
+        "cited_by_count": 0,
+        "referenced_works": [OA + r for r in refs],
+        "authorships": [{"author": {"id": OA + a, "display_name": a}} for a in authors],
+        "primary_location": {"source": {"id": OA + venue}} if venue else None,
+    }
+
+
+# W1 cites W10, W11; W2 cites W10, W12; W20 cites W1. W1 and W10 share A1.
+# W11 is not in OpenAlex, so it stays a stub.
+KG_WORKS = {w["id"].removeprefix(OA): w for w in [
+    _kg_work("W1", 2023, ["W10", "W11"], ["A1"], "S1"),
+    _kg_work("W2", 2022, ["W10", "W12"], ["A2"], "S2"),
+    _kg_work("W10", 2019, [], ["A1"], "S2"),
+    _kg_work("W12", 2018),
+    _kg_work("W20", 2024, ["W1"]),
+]}
+
+
+def _fake_get_works_by_ids(ids, fields=None):
+    return [KG_WORKS[short_id(i)] for i in ids if short_id(i) in KG_WORKS]
+
+
+def _fake_get_citing_works(ids, limit=50):
+    targets = {OA + short_id(i) for i in ids}
+    return [w for w in KG_WORKS.values() if targets & set(w["referenced_works"])][:limit]
+
+
+class TestKGIngestService(TestCase):
+    def setUp(self):
+        by_ids = patch.object(OpenAlexService, "get_works_by_ids",
+                              side_effect=_fake_get_works_by_ids)
+        citing = patch.object(OpenAlexService, "get_citing_works",
+                              side_effect=_fake_get_citing_works)
+        self.by_ids = by_ids.start()
+        self.citing = citing.start()
+        self.addCleanup(by_ids.stop)
+        self.addCleanup(citing.stop)
+
+    def test_build_creates_nodes_and_edges(self):
+        result = KGIngestService.build(["W1", "W2"])
+        self.assertEqual(result["seeds_found"], 2)
+        self.assertFalse(result["truncated"])
+        self.assertTrue(KGEdge.objects.filter(source__key="W1", target__key="W10", edge_type="CITES").exists())
+        self.assertTrue(KGEdge.objects.filter(source__key="W20", target__key="W1", edge_type="CITES").exists())
+        self.assertEqual(result["nodes_total"], KGNode.objects.count())
+        self.assertEqual(result["edges_total"], KGEdge.objects.count())
+        # W1, W2, W10, W12, W20 hydrated; W11 is a stub.
+        self.assertEqual(result["papers_hydrated"], 5)
+
+    def test_most_shared_reference_is_hydrated_first(self):
+        with patch.object(kg_ingest_service, "MAX_PRIOR_WORKS", 1):
+            KGIngestService.build(["W1", "W2"])
+        self.assertEqual(self.by_ids.call_args_list[1].args[0], ["W10"])
+
+    def test_unfetched_reference_stays_stub(self):
+        KGIngestService.build(["W1", "W2"])
+        self.assertTrue(KGNode.objects.get(key="W11").is_stub)
+        self.assertFalse(KGNode.objects.get(key="W10").is_stub)
+
+    def test_rebuild_is_idempotent(self):
+        KGIngestService.build(["W1", "W2"])
+        counts = (KGNode.objects.count(), KGEdge.objects.count())
+        KGIngestService.build(["W1", "W2"])
+        self.assertEqual((KGNode.objects.count(), KGEdge.objects.count()), counts)
+        self.assertFalse(KGNode.objects.get(key="W1").is_stub)
+
+    def test_stub_does_not_overwrite_hydrated(self):
+        KGIngestService.build(["W10"])
+        with patch.object(kg_ingest_service, "MAX_PRIOR_WORKS", 0):
+            KGIngestService.build(["W1"])
+        node = KGNode.objects.get(key="W10")
+        self.assertEqual(node.label, "Paper W10")
+        self.assertFalse(node.is_stub)
+
+    def test_citation_properties(self):
+        KGIngestService.build(["W1", "W2"])
+        e = KGEdge.objects.get(source__key="W1", target__key="W10", edge_type="CITES")
+        self.assertEqual(e.properties, {"timespan_years": 4, "author_self_citation": True,
+                                        "venue_self_citation": False})
+        stub_edge = KGEdge.objects.get(source__key="W1", target__key="W11", edge_type="CITES")
+        self.assertEqual(stub_edge.properties, {})
+
+    def test_no_seed_found_raises(self):
+        self.by_ids.side_effect = None
+        self.by_ids.return_value = []
+        with self.assertRaises(KGIngestError):
+            KGIngestService.build(["W999"])
+        self.assertEqual(KGNode.objects.count(), 0)
+
+    def test_openalex_failure_writes_nothing(self):
+        self.citing.side_effect = OpenAlexAPIError("boom")
+        with self.assertRaises(OpenAlexAPIError):
+            KGIngestService.build(["W1", "W2"])
+        self.assertEqual(KGNode.objects.count(), 0)
+        self.assertEqual(KGEdge.objects.count(), 0)
+
+    def test_citing_works_fetched_once_per_seed(self):
+        KGIngestService.build(["W1", "W2"])
+        self.assertEqual(self.citing.call_count, 2)
+        seen = set()
+        for call in self.citing.call_args_list:
+            self.assertEqual(len(call.args[0]), 1)
+            self.assertEqual(call.kwargs["limit"], kg_ingest_service.PER_SEED_CITERS)
+            seen.add(call.args[0][0])
+        self.assertEqual(seen, {"W1", "W2"})
+
+    def test_deadline_truncates_and_still_writes(self):
+        with patch.object(kg_ingest_service, "BUILD_BUDGET_SECONDS", 0):
+            result = KGIngestService.build(["W1", "W2"])
+        self.assertTrue(result["truncated"])
+        self.citing.assert_not_called()
+        self.assertFalse(KGNode.objects.get(key="W1").is_stub)
+        self.assertFalse(KGNode.objects.get(key="W10").is_stub)
+        self.assertFalse(KGNode.objects.filter(key="W20").exists())
+
+    def test_edges_use_reread_node_ids(self):
+        real_bulk_create = KGNode.objects.bulk_create
+
+        def bulk_create_without_pks(objs, **kwargs):
+            objs = list(objs)
+            real_bulk_create(objs, **kwargs)
+            for obj in objs:
+                obj.pk = None
+            return [KGNode(key=obj.key) for obj in objs]
+
+        with patch.object(KGNode.objects, "bulk_create", side_effect=bulk_create_without_pks):
+            KGIngestService.build(["W1", "W2"])
+        self.assertTrue(KGEdge.objects.filter(source__key="W1", target__key="W10", edge_type="CITES").exists())
+
+    def test_edge_with_missing_node_is_dropped(self):
+        def with_ghost_edge(work):
+            nodes, edges = work_to_graph(work)
+            return nodes, edges + [EdgeSpec(short_id(work["id"]), "W_GHOST", "CITES")]
+
+        with patch.object(kg_ingest_service, "work_to_graph", side_effect=with_ghost_edge):
+            result = KGIngestService.build(["W1", "W2"])
+        self.assertFalse(KGEdge.objects.filter(target__key="W_GHOST").exists())
+        self.assertEqual(result["edges_total"], KGEdge.objects.count())
