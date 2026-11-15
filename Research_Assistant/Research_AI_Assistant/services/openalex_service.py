@@ -48,6 +48,10 @@ RETRY_DELAY_SECONDS = 1.0
 # pyalex 0.21 (pyalex/api.py) sets no request timeout, so a hung OpenAlex call
 # cannot be interrupted: the build deadline only works between calls.
 ID_BATCH = 50
+# Thread-pool size for per-seed and per-title KG calls. Defined here so the
+# ingest service and the local resolver share it without importing each other.
+FETCH_WORKERS = 4
+TITLE_CANDIDATES = 5
 KG_WORK_FIELDS = [
     "id",
     "doi",
@@ -431,14 +435,32 @@ class OpenAlexService:
             return []
         return self._fetch_batches("openalex_id", list(ids), fields or KG_WORK_FIELDS)
 
-    def get_works_by_dois(self, dois: List[str]) -> List[Dict]:
-        """Raw works for DOIs (lower-cased, https://doi.org/ prefix removed)."""
-        if not dois:
-            return []
-        cleaned = [
-            d.strip().lower().removeprefix("https://doi.org/") for d in dois if d
-        ]
-        return self._fetch_batches("doi", cleaned, KG_WORK_FIELDS) if cleaned else []
+    def find_work_by_title(
+        self, title: str, year: Optional[int] = None
+    ) -> Optional[Dict]:
+        """The candidate with the most similar title that passes title_matches, else None."""
+        # Imported here: kg_local_resolver imports this module at its top.
+        from .kg_local_resolver import normalise_title, title_matches, title_similarity
+
+        # Punctuation removed: a comma would split the OpenAlex filter value.
+        cleaned = normalise_title(title)
+        if not cleaned:
+            return None
+        try:
+            query = Works().search_filter(title=cleaned).select(KG_WORK_FIELDS)
+            candidates = list(_get_with_retry(query, per_page=TITLE_CANDIDATES))
+        except Exception as e:
+            logger.error("OpenAlex title lookup failed", exc_info=True)
+            raise OpenAlexAPIError(
+                f"Failed to search OpenAlex by title: {str(e)}"
+                f"{_response_detail(e)}"
+            ) from e
+        matches = [w for w in candidates if title_matches(title, year, w)]
+        return max(
+            matches,
+            key=lambda w: title_similarity(title, w.get("title") or ""),
+            default=None,
+        )
 
     def get_citing_works(self, ids: List[str], limit: int = 50) -> List[Dict]:
         """Works citing any of `ids`, most cited first, at most `limit`."""

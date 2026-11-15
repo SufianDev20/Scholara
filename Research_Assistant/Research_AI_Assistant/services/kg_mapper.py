@@ -16,6 +16,7 @@ EDGE_VOCAB = {
     "PUBLISHED_IN": "soa:hasHostVenue",
     "HAS_TOPIC": "soa:hasTopic",
     "HAS_KEYWORD": "soa:hasKeyword",
+    "SAME_AS": "owl:sameAs",
 }
 
 

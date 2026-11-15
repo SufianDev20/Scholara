@@ -47,3 +47,17 @@ class PerformanceRateThrottle(SharedUserRateThrottle):
 
     scope = "performance"
     rate = "60/m"
+
+
+class GraphRateThrottle(SharedUserRateThrottle):
+    """Knowledge graph subgraph (database reads only)."""
+
+    scope = "graph"
+    rate = "20/m"
+
+
+class GraphBuildRateThrottle(SharedUserRateThrottle):
+    """Knowledge graph build: up to ~27 OpenAlex calls and a bulk write each."""
+
+    scope = "graph_build"
+    rate = "3/m"

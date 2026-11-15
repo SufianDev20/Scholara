@@ -11,10 +11,14 @@ Covers:
 """
 
 import json
+import threading
 from collections import Counter
 from datetime import timedelta
+from io import StringIO
 from unittest.mock import MagicMock, Mock, patch
 
+from django.core.cache import caches
+from django.core.management import call_command
 from django.db import IntegrityError, transaction
 from django.test import TestCase, Client, override_settings
 from django.urls import reverse
@@ -38,7 +42,19 @@ from .services.performance_tracker import (
 from .services.openalex_service import OpenAlexService, OpenAlexAPIError
 from .services import kg_ingest_service
 from .services.kg_ingest_service import KGIngestError, KGIngestService
+from .services.kg_graph_service import KGGraphError, KGGraphService
+from .services import kg_local_resolver
+from .services.kg_local_resolver import resolve_local_papers, title_matches, title_similarity
 from .services.kg_mapper import EDGE_VOCAB, EdgeSpec, short_id, work_to_graph
+from .services.kg_evaluation import (
+    citation_agreement,
+    largest_component_share,
+    precision_at_k,
+    reference_coverage,
+    topic_coherence,
+    verdict,
+)
+from .management.commands.evaluate_kg import crossref_reference_count, measure_coverage
 from .services.extract_service import ExtractionService
 from django.core.cache import cache
 
@@ -2007,12 +2023,22 @@ class TestOpenAlexGraphQueries(TestCase):
         self.assertEqual(query.get.call_count, 3)
 
     @patch("Research_AI_Assistant.services.openalex_service.Works")
-    def test_get_works_by_dois_normalises(self, mock_works):
-        query = self._chain(mock_works, [{"id": "W1"}])
-        OpenAlexService().get_works_by_dois(
-            ["https://doi.org/10.1000/ABC", "10.2000/Def"]
-        )
-        query.filter_or.assert_called_once_with(doi=["10.1000/abc", "10.2000/def"])
+    def test_find_work_by_title_returns_best_match(self, mock_works):
+        query = Mock()
+        query.search_filter.return_value = query
+        query.select.return_value = query
+        query.get.return_value = [
+            {"id": "W1", "title": "Knowledge Graph Embedding: A Survey", "publication_year": 2023},
+            {"id": "W2", "title": "Knowledge graphs - a surveys", "publication_year": 2023},
+            {"id": "W3", "title": "Knowledge Graphs: A Survey", "publication_year": 2023},
+        ]
+        mock_works.return_value = query
+        work = OpenAlexService().find_work_by_title("Knowledge Graphs: A Survey!", 2023)
+        query.search_filter.assert_called_once_with(title="knowledge graphs a survey")
+        query.get.assert_called_once_with(per_page=5)
+        self.assertEqual(work["id"], "W3")
+        query.get.return_value = [{"id": "W1", "title": "Something else", "publication_year": 2023}]
+        self.assertIsNone(OpenAlexService().find_work_by_title("Knowledge Graphs: A Survey", 2023))
 
 
 OA = "https://openalex.org/"
@@ -2067,7 +2093,7 @@ class TestKGMapper(TestCase):
         self.assertEqual(short_id("W12"), "W12")
 
     def test_edge_vocab_has_six_terms(self):
-        self.assertEqual(len(EDGE_VOCAB), 6)
+        self.assertEqual(len(EDGE_VOCAB), 7)
         self.assertEqual(EDGE_VOCAB["CITES"], "cito:cites")
 
     def test_full_work_counts(self):
@@ -2183,6 +2209,9 @@ KG_WORKS = {w["id"].removeprefix(OA): w for w in [
 
 def _fake_get_works_by_ids(ids, fields=None):
     return [KG_WORKS[short_id(i)] for i in ids if short_id(i) in KG_WORKS]
+
+
+LOCAL_T1 = "Linked data across the scholarly record"
 
 
 def _fake_get_citing_works(ids, limit=50):
@@ -2301,3 +2330,657 @@ class TestKGIngestService(TestCase):
             result = KGIngestService.build(["W1", "W2"])
         self.assertFalse(KGEdge.objects.filter(target__key="W_GHOST").exists())
         self.assertEqual(result["edges_total"], KGEdge.objects.count())
+
+    def test_deadline_stops_queued_citing_fetches(self):
+        # The test thread's clock never moves, so every seed is submitted; in the
+        # worker the budget expires after the first citing call.
+        test_thread = threading.current_thread()
+        worker_reads = []
+
+        def fake_monotonic():
+            if threading.current_thread() is test_thread:
+                return 0.0
+            worker_reads.append(1)
+            return 0.0 if len(worker_reads) == 1 else 100.0
+
+        fake_time = Mock(monotonic=fake_monotonic)
+        with patch.object(kg_ingest_service, "time", fake_time),                 patch.object(kg_ingest_service, "FETCH_WORKERS", 1):
+            result = KGIngestService.build(["W1", "W2"])
+        self.assertEqual(self.citing.call_count, 1)
+        self.assertTrue(result["truncated"])
+        self.assertFalse(KGNode.objects.get(key="W2").is_stub)
+        self.assertFalse(KGNode.objects.get(key="W10").is_stub)
+
+    def test_rebuild_keeps_citation_properties_when_target_is_stub(self):
+        KGIngestService.build(["W1", "W2"])
+        expected = {"timespan_years": 4, "author_self_citation": True,
+                    "venue_self_citation": False}
+        with patch.object(kg_ingest_service, "MAX_PRIOR_WORKS", 0):
+            KGIngestService.build(["W1"])
+        e = KGEdge.objects.get(source__key="W1", target__key="W10", edge_type="CITES")
+        self.assertEqual(e.properties, expected)
+
+    def _find_by_title(self):
+        def fake(title, year=None):
+            return {**KG_WORKS["W1"], "title": LOCAL_T1} if title == LOCAL_T1 else None
+
+        find = patch.object(OpenAlexService, "find_work_by_title", side_effect=fake)
+        self.addCleanup(find.stop)
+        return find.start()
+
+    def test_resolved_local_paper_gets_same_as_edge(self):
+        self._find_by_title()
+        result = KGIngestService.build([], local_papers=[{"id": "local:a.pdf", "title": LOCAL_T1, "year": 2023}])
+        e = KGEdge.objects.get(source__key="local:a.pdf", edge_type="SAME_AS")
+        self.assertEqual((e.target.key, e.provenance), ("W1", "title_match"))
+        self.assertEqual((e.weight, e.properties), (1.0, {"matched_on": "title+year"}))
+        self.assertTrue(KGEdge.objects.filter(source__key="W1", edge_type="CITES").exists())
+        node = KGNode.objects.get(key="local:a.pdf")
+        self.assertEqual((node.label, node.is_stub), (LOCAL_T1, False))
+        self.assertEqual(node.properties, {"origin": "local", "year": 2023})
+        self.assertEqual(result["local"], {"resolved": 1, "unresolved": []})
+
+    def test_unresolved_local_paper_is_an_isolated_node(self):
+        self._find_by_title()
+        result = KGIngestService.build(
+            ["W2"], local_papers=[{"id": "local:b.pdf", "title": "A paper OpenAlex does not have", "year": None}]
+        )
+        node = KGNode.objects.get(key="local:b.pdf")
+        self.assertEqual(node.properties["origin"], "local")
+        self.assertFalse(KGEdge.objects.filter(source=node).exists())
+        self.assertFalse(KGEdge.objects.filter(target=node).exists())
+        self.assertEqual(result["local"], {"resolved": 0, "unresolved": ["local:b.pdf"]})
+
+    def test_rebuild_replaces_same_as_edge(self):
+        target = {"key": "W1"}
+
+        def fake(title, year=None):
+            return {**KG_WORKS[target["key"]], "title": title} if target["key"] else None
+
+        find = patch.object(OpenAlexService, "find_work_by_title", side_effect=fake)
+        self.addCleanup(find.stop)
+        find.start()
+        local = [{"id": "local:a.pdf", "title": LOCAL_T1, "year": None}]
+
+        def same_as_targets():
+            return list(KGEdge.objects.filter(source__key="local:a.pdf", edge_type="SAME_AS")
+                        .values_list("target__key", flat=True))
+
+        KGIngestService.build([], local_papers=local)
+        self.assertEqual(same_as_targets(), ["W1"])
+        target["key"] = "W2"
+        KGIngestService.build([], local_papers=local)
+        self.assertEqual(same_as_targets(), ["W2"])
+        # Skipped by the deadline: the link is kept.
+        with patch.object(kg_local_resolver, "RESOLVE_BUDGET_SECONDS", 0):
+            KGIngestService.build([], local_papers=local)
+        self.assertEqual(same_as_targets(), ["W2"])
+        # Searched and not found: the link is removed.
+        target["key"] = None
+        KGIngestService.build([], local_papers=local)
+        self.assertEqual(same_as_targets(), [])
+
+    def test_slow_openalex_stops_every_fetch_phase_at_one_build_deadline(self):
+        # One fake clock for both modules; each title lookup takes 5 s. The
+        # build deadline (8 s) comes before the resolver's own 12 s budget.
+        clock = {"t": 0.0}
+        fake_time = Mock(monotonic=lambda: clock["t"])
+
+        def slow_find(title, year=None):
+            clock["t"] += 5
+            return None
+
+        find = patch.object(OpenAlexService, "find_work_by_title", side_effect=slow_find)
+        self.addCleanup(find.stop)
+        find = find.start()
+        local = [{"id": f"local:{i}.pdf", "title": LOCAL_T1, "year": None} for i in range(3)]
+        with patch.object(kg_ingest_service, "time", fake_time), \
+                patch.object(kg_local_resolver, "time", fake_time), \
+                patch.object(kg_local_resolver, "FETCH_WORKERS", 1), \
+                patch.object(kg_local_resolver, "RESOLVE_BUDGET_SECONDS", 12), \
+                patch.object(kg_ingest_service, "BUILD_BUDGET_SECONDS", 8):
+            result = KGIngestService.build(["W1"], local_papers=local)
+        self.assertEqual(find.call_count, 2)
+        self.citing.assert_not_called()
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["local"]["unresolved"], [p["id"] for p in local])
+        self.assertFalse(KGNode.objects.get(key="W1").is_stub)
+
+    def test_local_only_build_with_nothing_resolved_does_not_raise(self):
+        self._find_by_title()
+        result = KGIngestService.build([], local_papers=[{"id": "local:b.pdf", "title": "Untitled paper", "year": None}])
+        self.assertEqual(result["seeds_found"], 0)
+        self.assertEqual(result["local"]["unresolved"], ["local:b.pdf"])
+        self.assertEqual(list(KGNode.objects.values_list("key", flat=True)), ["local:b.pdf"])
+        self.by_ids.assert_not_called()
+
+
+class TestPruneKGStubs(TestCase):
+    def _stub(self, key, citers, age_days=30):
+        stub = KGNode.objects.create(node_type="paper", key=key, is_stub=True)
+        for i in range(citers):
+            citer = KGNode.objects.create(node_type="paper", key=f"{key}-c{i}")
+            KGEdge.objects.create(source=citer, target=stub, edge_type="CITES")
+        KGNode.objects.filter(pk=stub.pk).update(
+            updated_at=timezone.now() - timedelta(days=age_days)
+        )
+        return stub
+
+    def _run(self, *args):
+        out = StringIO()
+        call_command("prune_kg_stubs", *args, stdout=out)
+        return out.getvalue()
+
+    def test_prunes_old_single_citer_stub(self):
+        self._stub("OLD", 1)
+        self._stub("RECENT", 1, age_days=1)
+        self._run()
+        self.assertFalse(KGNode.objects.filter(key="OLD").exists())
+        self.assertTrue(KGNode.objects.filter(key="RECENT").exists())
+        self.assertFalse(KGEdge.objects.filter(target__key="OLD").exists())
+        self.assertTrue(KGNode.objects.filter(key="OLD-c0").exists())
+
+    def test_keeps_stub_cited_by_two_papers(self):
+        self._stub("TWO", 2)
+        self._run()
+        self.assertTrue(KGNode.objects.filter(key="TWO").exists())
+        self.assertEqual(KGEdge.objects.filter(target__key="TWO").count(), 2)
+
+    def test_dry_run_deletes_nothing(self):
+        self._stub("OLD", 1)
+        before = (KGNode.objects.count(), KGEdge.objects.count())
+        out = self._run("--dry-run")
+        self.assertEqual((KGNode.objects.count(), KGEdge.objects.count()), before)
+        self.assertIn("Dry run", out)
+
+    def test_deletes_in_chunks(self):
+        for i in range(3):
+            self._stub(f"OLD{i}", 1)
+        with patch(
+            "Research_AI_Assistant.management.commands.prune_kg_stubs.DELETE_CHUNK_SIZE",
+            1,
+        ):
+            self._run()
+        self.assertFalse(KGNode.objects.filter(key__startswith="OLD", is_stub=True).exists())
+
+
+class TestKGGraphService(TestCase):
+    def _paper(self, key, stub=False):
+        return KGNode.objects.create(node_type="paper", key=key, label="" if stub else f"Title {key}", is_stub=stub)
+
+    def _edge(self, source, target, edge_type="CITES"):
+        return KGEdge.objects.create(source=source, target=target, edge_type=edge_type)
+
+    def _ids(self, result, node_type=None):
+        return {n["id"] for n in result["nodes"] if node_type is None or n["type"] == node_type}
+
+    def test_bibliographic_coupling_weight(self):
+        refs = {"A": {"R1", "R2", "R3", "R4"}, "B": {"R1", "R2", "R5", "R6"}}
+        edges = KGGraphService.similarity_edges(refs, citers={})
+        self.assertEqual(len(edges), 1)
+        self.assertAlmostEqual(edges[0]["weight"], 0.5)          # 2 / sqrt(4 * 4)
+        self.assertEqual(edges[0]["properties"], {"method": "bibliographic_coupling", "shared": 2})
+        self.assertEqual((edges[0]["source"], edges[0]["target"], edges[0]["type"]), ("A", "B", "SIMILAR_TO"))
+
+    def test_co_citation_wins_when_larger(self):
+        refs = {"A": {"R1", "R2", "R3", "R4"}, "B": {"R1", "R5", "R6", "R7"}}   # 1 / 4 = 0.25
+        citers = {"A": {"C1", "C2"}, "B": {"C1", "C2"}}                          # 2 / 2 = 1.0
+        edges = KGGraphService.similarity_edges(refs, citers)
+        self.assertEqual(len(edges), 1)
+        self.assertAlmostEqual(edges[0]["weight"], 1.0)
+        self.assertEqual(edges[0]["properties"], {"method": "co_citation", "shared": 2})
+
+    def test_co_citation_needs_two_shared_citers(self):
+        # One shared citer would score 1 / sqrt(1 * 1) = 1.0, the maximum.
+        self.assertEqual(KGGraphService.similarity_edges({}, {"A": {"C1"}, "B": {"C1"}}), [])
+        edges = KGGraphService.similarity_edges({}, {"A": {"C1", "C2"}, "B": {"C1", "C2"}})
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0]["properties"], {"method": "co_citation", "shared": 2})
+
+    def test_weak_similarity_is_dropped(self):
+        refs = {"A": {f"RA{i}" for i in range(9)} | {"R"}, "B": {f"RB{i}" for i in range(9)} | {"R"}}
+        self.assertEqual(KGGraphService.similarity_edges(refs, citers={}), [])   # 1 / 10 < 0.15
+
+    def test_top_k_per_paper(self):
+        # A is equally similar (1 / sqrt(14)) to P0..P6; the partners are more similar to each other.
+        refs = {"A": {f"R{i}" for i in range(7)}}
+        refs.update({f"P{i}": {"S", f"R{i}"} for i in range(7)})
+        edges = KGGraphService.similarity_edges(refs, citers={})
+        partners = sorted(e["target"] for e in edges if e["source"] == "A")
+        self.assertEqual(partners, ["P0", "P1", "P2", "P3", "P4"])
+
+    def test_empty_reference_sets_do_not_divide_by_zero(self):
+        self.assertEqual(KGGraphService.similarity_edges({"A": set(), "B": set()}, {"A": set(), "B": set()}), [])
+
+    def test_subgraph_scope_is_one_citation_hop(self):
+        w1, w10, w99 = self._paper("W1"), self._paper("W10"), self._paper("W99")
+        self._edge(w1, w10)
+        self._edge(w10, w99)
+        result = KGGraphService.subgraph(["W1"])
+        self.assertEqual(self._ids(result, "paper"), {"W1", "W10"})
+
+    def test_stubs_excluded_by_default(self):
+        w1, w11 = self._paper("W1"), self._paper("W11", stub=True)
+        self._edge(w1, w11)
+        self.assertNotIn("W11", self._ids(KGGraphService.subgraph(["W1"])))
+        with_stubs = KGGraphService.subgraph(["W1"], include_stubs=True)
+        self.assertIn("W11", self._ids(with_stubs))
+        self.assertIn(("W1", "W11", "CITES"), {(e["source"], e["target"], e["type"]) for e in with_stubs["edges"]})
+
+    def test_edge_type_filter(self):
+        w1, w10 = self._paper("W1"), self._paper("W10")
+        author = KGNode.objects.create(node_type="author", key="A1", label="Ada")
+        inst = KGNode.objects.create(node_type="institution", key="I1", label="Uni")
+        self._edge(w1, w10)
+        self._edge(w1, author, "AUTHORED_BY")
+        self._edge(author, inst, "AFFILIATED_WITH")
+
+        full = KGGraphService.subgraph(["W1"])
+        self.assertEqual((full["stats"]["authors"], full["stats"]["institutions"]), (1, 1))
+
+        only_cites = KGGraphService.subgraph(["W1"], edge_types={"CITES"})
+        self.assertEqual(self._ids(only_cites), {"W1", "W10"})
+        self.assertEqual({e["type"] for e in only_cites["edges"]} - {"SIMILAR_TO"}, {"CITES"})
+
+        no_cites = KGGraphService.subgraph(["W1"], edge_types={"AUTHORED_BY"})
+        self.assertEqual(self._ids(no_cites, "paper"), {"W1", "W10"})       # scope still uses CITES
+        self.assertEqual({e["type"] for e in no_cites["edges"]}, {"AUTHORED_BY"})
+        self.assertNotIn("I1", self._ids(no_cites))
+
+    def test_prior_and_derivative_works(self):
+        w1, w10, w20 = self._paper("W1"), self._paper("W10"), self._paper("W20")
+        self._edge(w1, w10)
+        self._edge(w20, w1)
+        result = KGGraphService.subgraph(["https://openalex.org/W1", "W1"])
+        self.assertEqual(result["prior_works"], ["W10"])
+        self.assertEqual(result["derivative_works"], ["W20"])
+        seeds = [n["id"] for n in result["nodes"] if n["is_seed"]]
+        self.assertEqual(seeds, ["W1"])
+
+    def test_metrics_and_stats(self):
+        w1, w2, w10 = self._paper("W1"), self._paper("W2"), self._paper("W10")
+        self._edge(w1, w10)
+        self._edge(w2, w10)
+        result = KGGraphService.subgraph(["W1", "W2"])
+        nodes = {n["id"]: n for n in result["nodes"]}
+        self.assertEqual(nodes["W10"]["metrics"]["in_degree"], 2)
+        self.assertEqual(nodes["W1"]["metrics"]["out_degree"], 1)
+        self.assertEqual(nodes["W1"]["origin"], "openalex")
+        self.assertEqual(result["stats"]["papers"], len(self._ids(result, "paper")))
+        self.assertEqual(result["stats"]["papers"], 3)
+        self.assertEqual(result["stats"]["edges"], len(result["edges"]))
+        similar = [e for e in result["edges"] if e["type"] == "SIMILAR_TO"]
+        self.assertEqual([(e["source"], e["target"]) for e in similar], [("W1", "W2")])
+        self.assertEqual(nodes["W1"]["metrics"]["cluster"], nodes["W2"]["metrics"]["cluster"])
+
+        plain = KGGraphService.subgraph(["W1", "W2"], similarity=False)
+        self.assertFalse([e for e in plain["edges"] if e["type"] == "SIMILAR_TO"])
+        self.assertTrue(all(n["metrics"]["cluster"] is None for n in plain["nodes"]))
+
+    def test_single_paper_graph(self):
+        self._paper("W1")
+        result = KGGraphService.subgraph(["W1"])
+        self.assertEqual(len(result["nodes"]), 1)
+        self.assertIsInstance(result["nodes"][0]["metrics"]["cluster"], int)
+        self.assertEqual(result["edges"], [])
+        self.assertEqual(result["stats"]["edges"], 0)
+
+    def test_unknown_seeds_raise(self):
+        self._paper("W11", stub=True)
+        with self.assertRaises(KGGraphError):
+            KGGraphService.subgraph(["W404", "W11"])
+
+    def test_local_seed_follows_same_as(self):
+        local, w1, w10, w20 = (self._paper(k) for k in ("local:a.pdf", "W1", "W10", "W20"))
+        self._edge(local, w1, "SAME_AS")
+        self._edge(w1, w10)
+        self._edge(w20, w1)
+        result = KGGraphService.subgraph(["local:a.pdf"])
+        self.assertEqual(self._ids(result, "paper"), {"local:a.pdf", "W1", "W10", "W20"})
+        seeds = {n["id"] for n in result["nodes"] if n["is_seed"]}
+        self.assertEqual(seeds, {"local:a.pdf", "W1"})
+        self.assertIn(("local:a.pdf", "W1", "SAME_AS"),
+                      {(e["source"], e["target"], e["type"]) for e in result["edges"]})
+        self.assertEqual(result["prior_works"], ["W10"])
+        # An unresolved local seed alone is still a graph of one node.
+        self._paper("local:b.pdf")
+        lone = KGGraphService.subgraph(["local:b.pdf"])
+        self.assertEqual(self._ids(lone), {"local:b.pdf"})
+
+    def test_origin_field(self):
+        local, w1, w2 = self._paper("local:a.pdf"), self._paper("W1"), self._paper("W2")
+        self._edge(local, w1, "SAME_AS")
+        self._edge(w2, w1)
+        result = KGGraphService.subgraph(["W2"])
+        nodes = {n["id"]: n for n in result["nodes"]}
+        self.assertEqual(nodes["local:a.pdf"]["origin"], "local")      # joined by SAME_AS to W1
+        self.assertFalse(nodes["local:a.pdf"]["is_seed"])
+        self.assertIsNone(nodes["local:a.pdf"]["metrics"]["cluster"])
+        self.assertEqual(nodes["W1"]["origin"], "openalex")
+
+
+class TestKGGraphViews(ClerkAuthTestMixin, TestCase):
+    """POST api/graph/build/ and GET api/graph/subgraph/."""
+
+    def _build(self, ids):
+        return self.client.post(
+            reverse("research_ai_assistant:graph_build"),
+            data=json.dumps({"paper_ids": ids}),
+            content_type="application/json",
+        )
+
+    def _subgraph(self, **params):
+        return self.client.get(reverse("research_ai_assistant:graph_subgraph"), params)
+
+    @patch("Research_AI_Assistant.views_graph.KGGraphService")
+    @patch("Research_AI_Assistant.views_graph.KGIngestService")
+    def test_build_returns_build_and_graph(self, mock_ingest, mock_graph):
+        mock_ingest.build.return_value = {"seeds_found": 1}
+        mock_graph.subgraph.return_value = {"nodes": [], "edges": []}
+        resp = self._build(["W1"])
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(set(resp.json()), {"build", "graph"})
+        self.assertEqual(resp.json()["build"], {"seeds_found": 1})
+
+    @patch("Research_AI_Assistant.views_graph.KGGraphService")
+    @patch("Research_AI_Assistant.views_graph.KGIngestService")
+    def test_build_normalises_full_urls(self, mock_ingest, mock_graph):
+        mock_ingest.build.return_value = {}
+        mock_graph.subgraph.return_value = {}
+        resp = self._build(["https://openalex.org/W1", "W1"])
+        self.assertEqual(resp.status_code, 200)
+        mock_ingest.build.assert_called_once_with(["W1"], local_papers=[])
+
+    @patch("Research_AI_Assistant.views_graph.KGIngestService")
+    def test_build_rejects_non_openalex_id(self, mock_ingest):
+        resp = self._build(["local-123"])
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("local-123", resp.content.decode())
+        mock_ingest.build.assert_not_called()
+
+    @patch("Research_AI_Assistant.views_graph.KGIngestService")
+    def test_build_rejects_26_ids(self, mock_ingest):
+        resp = self._build([f"W{i}" for i in range(1, 27)])
+        self.assertEqual(resp.status_code, 400)
+        mock_ingest.build.assert_not_called()
+
+    @patch("Research_AI_Assistant.views_graph.KGIngestService")
+    def test_build_openalex_error_is_502(self, mock_ingest):
+        mock_ingest.build.side_effect = OpenAlexAPIError("down")
+        self.assertEqual(self._build(["W1"]).status_code, 502)
+
+    @patch("Research_AI_Assistant.views_graph.KGIngestService")
+    def test_build_no_seed_found_is_404(self, mock_ingest):
+        mock_ingest.build.side_effect = KGIngestError("none found")
+        self.assertEqual(self._build(["W1"]).status_code, 404)
+
+    @patch("Research_AI_Assistant.views_graph.KGGraphService")
+    def test_subgraph_parses_query(self, mock_graph):
+        mock_graph.subgraph.return_value = {"nodes": [], "edges": []}
+        resp = self._subgraph(ids="W1", edge_types="CITES", similarity="0")
+        self.assertEqual(resp.status_code, 200)
+        mock_graph.subgraph.assert_called_once_with(
+            ["W1"], edge_types={"CITES"}, similarity=False, include_stubs=False
+        )
+
+    @patch("Research_AI_Assistant.views_graph.KGGraphService")
+    def test_subgraph_defaults(self, mock_graph):
+        mock_graph.subgraph.return_value = {}
+        self._subgraph(ids="https://openalex.org/W1,W2,W1")
+        mock_graph.subgraph.assert_called_once_with(
+            ["W1", "W2"], edge_types=None, similarity=True, include_stubs=False
+        )
+
+    @patch("Research_AI_Assistant.views_graph.KGGraphService")
+    def test_subgraph_unknown_edge_type_is_400(self, mock_graph):
+        resp = self._subgraph(ids="W1", edge_types="CITES,BOGUS")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("BOGUS", resp.content.decode())
+        mock_graph.subgraph.assert_not_called()
+
+    @patch("Research_AI_Assistant.views_graph.KGGraphService")
+    def test_subgraph_bad_id_and_flags_are_400(self, mock_graph):
+        resp = self._subgraph(ids="local-123")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("local-123", resp.content.decode())
+        self.assertEqual(self._subgraph(ids="W1", similarity="yes").status_code, 400)
+        self.assertEqual(self._subgraph(ids="W1", include_stubs="2").status_code, 400)
+        mock_graph.subgraph.assert_not_called()
+
+    @patch("Research_AI_Assistant.views_graph.KGGraphService")
+    def test_subgraph_missing_ids_is_400(self, mock_graph):
+        self.assertEqual(self._subgraph().status_code, 400)
+        mock_graph.subgraph.assert_not_called()
+
+    @patch("Research_AI_Assistant.views_graph.KGGraphService")
+    def test_subgraph_unknown_seed_is_404(self, mock_graph):
+        mock_graph.subgraph.side_effect = KGGraphError("no seed")
+        self.assertEqual(self._subgraph(ids="W1").status_code, 404)
+
+    def _post(self, body):
+        return self.client.post(
+            reverse("research_ai_assistant:graph_build"),
+            data=json.dumps(body),
+            content_type="application/json",
+        )
+
+    @patch("Research_AI_Assistant.views_graph.KGGraphService")
+    @patch("Research_AI_Assistant.views_graph.KGIngestService")
+    def test_build_accepts_local_papers_only(self, mock_ingest, mock_graph):
+        mock_ingest.build.return_value = {}
+        mock_graph.subgraph.return_value = {}
+        local = [{"id": "local:a.pdf", "title": "Linked data across the record", "year": 2023},
+                 {"id": "local:b.pdf", "title": "Another paper title", "year": None}]
+        resp = self._post({"local_papers": local})
+        self.assertEqual(resp.status_code, 200)
+        mock_ingest.build.assert_called_once_with([], local_papers=local)
+        mock_graph.subgraph.assert_called_once_with(["local:a.pdf", "local:b.pdf"])
+        # The subgraph endpoint accepts the same local ids.
+        mock_graph.subgraph.reset_mock()
+        self.assertEqual(self._subgraph(ids="local:a.pdf,W1").status_code, 200)
+        mock_graph.subgraph.assert_called_once_with(
+            ["local:a.pdf", "W1"], edge_types=None, similarity=True, include_stubs=False
+        )
+        self.assertEqual(self._subgraph(ids="local:" + "x" * 115).status_code, 400)
+
+    @patch("Research_AI_Assistant.views_graph.KGIngestService")
+    def test_build_rejects_empty_request(self, mock_ingest):
+        self.assertEqual(self._post({}).status_code, 400)
+        self.assertEqual(self._post({"paper_ids": [], "local_papers": []}).status_code, 400)
+        mock_ingest.build.assert_not_called()
+
+    @patch("Research_AI_Assistant.views_graph.KGIngestService")
+    def test_build_rejects_11_local_papers(self, mock_ingest):
+        local = [{"id": f"local:{i}.pdf", "title": "Some paper title", "year": 2020} for i in range(11)]
+        self.assertEqual(self._post({"local_papers": local}).status_code, 400)
+        # Other invalid shapes: wrong prefix, id too long, combined length over 25.
+        bad_id = [{"id": "a.pdf", "title": "Some paper title", "year": 2020}]
+        self.assertEqual(self._post({"local_papers": bad_id}).status_code, 400)
+        long_id = [{"id": "local:" + "x" * 115, "title": "Some paper title", "year": 2020}]
+        self.assertEqual(self._post({"local_papers": long_id}).status_code, 400)
+        combined = {"paper_ids": [f"W{i}" for i in range(1, 17)], "local_papers": local[:10]}
+        caches["throttle"].clear()  # the build limit (3/min) counts rejected requests too
+        self.assertEqual(self._post(combined).status_code, 400)
+        mock_ingest.build.assert_not_called()
+
+    def test_graph_throttle_is_user_throttle(self):
+        import inspect
+        from rest_framework.throttling import AnonRateThrottle
+        from . import throttles
+
+        self.assertTrue(issubclass(throttles.GraphRateThrottle, throttles.SharedUserRateThrottle))
+        self.assertFalse(issubclass(throttles.GraphRateThrottle, AnonRateThrottle))
+        self.assertEqual(throttles.GraphRateThrottle.scope, "graph")
+        self.assertEqual(throttles.GraphRateThrottle.rate, "20/m")
+        others = [
+            c.scope
+            for _, c in inspect.getmembers(throttles, inspect.isclass)
+            if issubclass(c, throttles.SharedUserRateThrottle)
+            and c not in (throttles.SharedUserRateThrottle, throttles.GraphRateThrottle)
+        ]
+        self.assertTrue(others)
+        self.assertNotIn("graph", others)
+        self.assertTrue(issubclass(throttles.GraphBuildRateThrottle, throttles.SharedUserRateThrottle))
+        self.assertEqual(throttles.GraphBuildRateThrottle.scope, "graph_build")
+        self.assertEqual(throttles.GraphBuildRateThrottle.rate, "3/m")
+
+    @patch("Research_AI_Assistant.views_graph.KGGraphService")
+    @patch("Research_AI_Assistant.views_graph.KGIngestService")
+    def test_build_is_limited_to_3_per_minute_and_subgraph_is_not(self, mock_ingest, mock_graph):
+        mock_ingest.build.return_value = {}
+        mock_graph.subgraph.return_value = {}
+        statuses = [self._build(["W1"]).status_code for _ in range(4)]
+        self.assertEqual(statuses, [200] * 3 + [429])
+        self.assertEqual(self._subgraph(ids="W1").status_code, 200)
+
+
+class TestKGGraphAuth(TestCase):
+    """Graph endpoints require a Clerk token (real ClerkAuthentication runs)."""
+
+    @patch("Research_AI_Assistant.views_graph.KGIngestService")
+    def test_build_requires_auth(self, mock_ingest):
+        resp = self.client.post(
+            reverse("research_ai_assistant:graph_build"),
+            data=json.dumps({"paper_ids": ["W1"]}),
+            content_type="application/json",
+        )
+        self.assertEqual(resp.status_code, 401)
+        mock_ingest.build.assert_not_called()
+
+    @patch("Research_AI_Assistant.views_graph.KGGraphService")
+    def test_subgraph_requires_auth(self, mock_graph):
+        resp = self.client.get(
+            reverse("research_ai_assistant:graph_subgraph"), {"ids": "W1"}
+        )
+        self.assertEqual(resp.status_code, 401)
+        mock_graph.subgraph.assert_not_called()
+
+
+class TestKGLocalResolver(TestCase):
+    """Matching local-corpus papers to OpenAlex works by title and year."""
+
+    @staticmethod
+    def _work(title, year):
+        return {"id": OA + "W1", "title": title, "publication_year": year}
+
+    def _find(self, side_effect):
+        find = patch.object(OpenAlexService, "find_work_by_title", side_effect=side_effect)
+        self.addCleanup(find.stop)
+        return find.start()
+
+    def test_title_similarity_ignores_case_and_punctuation(self):
+        self.assertEqual(title_similarity("SemOpenAlex: The Scientific Landscape!",
+                                          "semopenalex the scientific landscape"), 1.0)
+
+    def test_match_rejects_year_two_apart(self):
+        title = "Linked data across the scholarly record"
+        self.assertFalse(title_matches(title, 2019, self._work(title, 2021)))
+        self.assertFalse(title_matches(title, 2019, self._work(title, 2023)))
+
+    def test_match_accepts_year_one_apart(self):
+        title = "Linked data across the scholarly record"
+        self.assertTrue(title_matches(title, 2022, self._work(title, 2023)))
+
+    def test_match_accepts_unknown_local_year(self):
+        title = "Linked data across the scholarly record"
+        self.assertTrue(title_matches(title, None, self._work(title, 2023)))
+
+    def test_match_rejects_similar_but_different_title(self):
+        self.assertFalse(title_matches("Knowledge Graphs: A Survey", 2021,
+                                       self._work("Knowledge Graph Embedding: A Survey", 2021)))
+
+    def test_untitled_paper_makes_no_call(self):
+        find = self._find(lambda title, year=None: None)
+        resolved, unresolved, truncated, searched = resolve_local_papers([
+            {"id": "local:a.pdf", "title": "Untitled paper", "year": 2020},
+            {"id": "local:b.pdf", "title": "Short", "year": 2020},
+        ])
+        self.assertEqual((resolved, unresolved, truncated), ({}, ["local:a.pdf", "local:b.pdf"], False))
+        self.assertEqual(searched, set())
+        find.assert_not_called()
+
+    def test_resolve_splits_resolved_and_unresolved(self):
+        title = "Linked data across the scholarly record"
+        work = self._work(title, 2023)
+        self._find(lambda t, year=None: work if t == title else None)
+        resolved, unresolved, truncated, searched = resolve_local_papers([
+            {"id": "local:a.pdf", "title": title, "year": 2023},
+            {"id": "local:b.pdf", "title": "A paper OpenAlex does not have", "year": None},
+            {"id": "local:c.pdf", "title": title, "year": None},
+        ])
+        self.assertEqual(resolved, {"local:a.pdf": (work, 1.0, "title+year"),
+                                    "local:c.pdf": (work, 1.0, "title")})
+        self.assertEqual(unresolved, ["local:b.pdf"])
+        self.assertFalse(truncated)
+        self.assertEqual(searched, {"local:a.pdf", "local:b.pdf", "local:c.pdf"})
+
+    def test_resolve_stops_at_deadline(self):
+        find = self._find(lambda title, year=None: None)
+        papers = [{"id": f"local:{i}.pdf", "title": "Linked data across the record", "year": None}
+                  for i in range(3)]
+        with patch.object(kg_local_resolver, "RESOLVE_BUDGET_SECONDS", 0):
+            resolved, unresolved, truncated, searched = resolve_local_papers(papers)
+        self.assertEqual(resolved, {})
+        self.assertEqual(unresolved, [p["id"] for p in papers])
+        self.assertTrue(truncated)
+        self.assertEqual(searched, set())
+        find.assert_not_called()
+
+
+class TestKGEvaluationMetrics(TestCase):
+    """Pure metric functions of the KG evaluation, and its not-measurable rule."""
+
+    def test_reference_coverage(self):
+        self.assertAlmostEqual(reference_coverage(47, 58), 0.8103, places=4)
+        self.assertIsNone(reference_coverage(10, 0))
+
+    def test_citation_agreement(self):
+        kg = {("10.1/a", "10.1/b"), ("10.1/a", "10.1/c"), ("10.1/a", "10.1/d"), ("10.1/a", "10.1/e")}
+        ref = {("10.1/a", "10.1/b"), ("10.1/a", "10.1/c"), ("10.1/a", "10.1/d"), ("10.1/a", "10.1/z")}
+        self.assertEqual(citation_agreement(kg, ref), 0.75)
+        self.assertIsNone(citation_agreement(set(), ref))
+
+    def test_citation_agreement_normalises_doi_case(self):
+        kg = {("10.1/A", "https://doi.org/10.1/B")}
+        ref = {("10.1/a", "10.1/b")}
+        self.assertEqual(citation_agreement(kg, ref), 1.0)
+
+    def test_topic_coherence_skips_unknown_subfields(self):
+        pairs = [("W1", "W2"), ("W1", "W3"), ("W1", "W4")]
+        sub = {"W1": "AI", "W2": "AI", "W3": "Ecology", "W4": None}
+        self.assertEqual(topic_coherence(pairs, sub), 0.5)
+
+    def test_precision_at_k(self):
+        self.assertEqual(precision_at_k(["a", "b", "c", "d", "e", "f"], {"a", "c", "f"}), 0.4)
+        self.assertIsNone(precision_at_k([], {"a"}))
+
+    def test_largest_component_share(self):
+        share = largest_component_share(["a", "b", "c", "d"], [("a", "b"), ("b", "c")])
+        self.assertEqual(share, 0.75)
+
+    def test_verdict(self):
+        self.assertEqual(verdict(0.81, 0.70), "met")
+        self.assertEqual(verdict(0.60, 0.70), "missed")
+        self.assertEqual(verdict(0.30, None), "reported")
+        self.assertEqual(verdict(None, 0.70), "not measurable")
+        self.assertEqual(verdict(9.0, 15.0, higher_is_better=False), "met")
+
+    def test_failed_reference_source_is_not_measurable(self):
+        def fake_get(url, **kwargs):
+            response = Mock()
+            if "10.1/a" in url:
+                response.status_code = 503
+                response.json.side_effect = ValueError("no body")
+            else:
+                response.status_code = 200
+                response.json.return_value = {"message": {"reference-count": 10}}
+            return response
+
+        with patch("Research_AI_Assistant.management.commands.evaluate_kg.requests.get",
+                   side_effect=fake_get):
+            value, covered, _ = measure_coverage(
+                [("10.1/a", 5), ("10.1/b", 8)], crossref_reference_count
+            )
+        # Paper a (503) is in neither numerator nor denominator: only b's 8/10 counts.
+        self.assertEqual(covered, 1)
+        self.assertEqual(value, 0.8)

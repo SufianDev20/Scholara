@@ -1,10 +1,10 @@
 """Build the knowledge graph from seed papers.
 
-Fetch the seeds from OpenAlex, expand one hop (the references most seeds
-share, and the works citing each seed), map every work with
-``work_to_graph`` and upsert the nodes and edges in one transaction.
-All fetching finishes before the transaction opens, so a failed OpenAlex
-call writes nothing.
+Match any local-corpus papers to OpenAlex works by title, fetch the seeds
+from OpenAlex, expand one hop (the references most seeds share, and the
+works citing each seed), map every work with ``work_to_graph`` and upsert
+the nodes and edges in one transaction. All fetching finishes before the
+transaction opens, so a failed OpenAlex call writes nothing.
 """
 
 import time
@@ -14,39 +14,62 @@ from concurrent.futures import ThreadPoolExecutor
 from django.db import transaction
 
 from ..models import KGEdge, KGNode
+from .kg_local_resolver import resolve_local_papers
 from .kg_mapper import EdgeSpec, NodeSpec, short_id, work_to_graph
-# ID_BATCH (IDs per OpenAlex call) is defined once there and re-exported here
-# with the other build limits.
-from .openalex_service import ID_BATCH, OpenAlexAPIError, OpenAlexService  # noqa: F401
+# ID_BATCH (IDs per OpenAlex call) and FETCH_WORKERS (pool size, shared with
+# kg_local_resolver) are defined once there and re-exported here with the
+# other build limits.
+from .openalex_service import (  # noqa: F401
+    FETCH_WORKERS, ID_BATCH, OpenAlexAPIError, OpenAlexService,
+)
 
 MAX_SEEDS = 25
 MAX_PRIOR_WORKS = 50
 PER_SEED_CITERS = 10
 MAX_DERIVATIVE_WORKS = 50
-FETCH_WORKERS = 4
-# Checked only between OpenAlex calls; pyalex sets no timeout, so one hung call can outlast it.
-BUILD_BUDGET_SECONDS = 20
+# One deadline from the start of the build, shared by local resolution and the
+# citing-works fetch. Checked only between OpenAlex calls; pyalex sets no timeout,
+# so in-flight calls finish after it. Kept well under gunicorn's 30 s to leave
+# room for those calls, the DB write and the view's subgraph read.
+BUILD_BUDGET_SECONDS = 12
 
 EDGE_BATCH = 1000
+LOCAL_MATCH_PROVENANCE = "title_match"
 
 
 class KGIngestError(Exception):
-    """None of the requested seeds exist in OpenAlex."""
+    """No seed exists in OpenAlex and no local paper was given."""
 
 
 class KGIngestService:
     @classmethod
-    def build(cls, seed_keys: list[str]) -> dict:
-        """Fetch, expand and upsert the graph for `seed_keys`.
+    def build(cls, seed_keys: list[str], local_papers: list[dict] | None = None) -> dict:
+        """Fetch, expand and upsert the graph for `seed_keys` and `local_papers`.
 
-        Raises KGIngestError when no seed is found; lets OpenAlexAPIError propagate.
+        Each local paper ({"id": "local:...", "title", "year"}) becomes a node;
+        one matched to an OpenAlex work gets a SAME_AS edge and its work joins
+        the seeds (MAX_SEEDS applies to the combined set). Local resolution
+        and the citing-works fetch stop at one deadline, BUILD_BUDGET_SECONDS
+        after the build starts.
+
+        Raises KGIngestError when no seed is found and no local paper was
+        given; lets OpenAlexAPIError propagate.
+        `nodes_total` / `edges_total` count the specs this build submitted, not rows changed.
         """
-        start = time.monotonic()
+        deadline = time.monotonic() + BUILD_BUDGET_SECONDS
         api = OpenAlexService()
+        local_papers = list(local_papers or [])
+        resolved, unresolved, resolve_truncated, searched = (
+            resolve_local_papers(local_papers, deadline=deadline)
+            if local_papers else ({}, [], False, set())
+        )
 
         keys = list(dict.fromkeys(short_id(k) for k in seed_keys if k))[:MAX_SEEDS]
-        seeds = api.get_works_by_ids(keys) if keys else []
-        if not seeds:
+        by_key = {short_id(w["id"]): w for w in (api.get_works_by_ids(keys) if keys else [])}
+        for work, _, _ in resolved.values():
+            by_key.setdefault(short_id(work["id"]), work)
+        seeds = list(by_key.values())[:MAX_SEEDS]
+        if not seeds and not local_papers:
             raise KGIngestError("None of the seed papers were found in OpenAlex.")
         seed_ids = [short_id(w["id"]) for w in seeds]
         fetched = set(seed_ids)
@@ -55,11 +78,12 @@ class KGIngestService:
         prior = api.get_works_by_ids(prior_ids) if prior_ids else []
         fetched.update(short_id(w["id"]) for w in prior)
 
-        derivative, truncated = cls._fetch_citing(api, seed_ids, start, fetched)
+        derivative, truncated = cls._fetch_citing(api, seed_ids, deadline, fetched)
 
         nodes, edges = cls._merge_specs(seeds + prior + derivative)
         cls._set_citation_properties(nodes, edges)
-        edges_written = cls._write(nodes, edges)
+        cls._add_local_specs(local_papers, resolved, nodes, edges)
+        edges_written = cls._write(nodes, edges, replace_same_as=searched)
 
         return {
             "seeds_found": len(seeds),
@@ -68,8 +92,23 @@ class KGIngestService:
             ),
             "nodes_total": len(nodes),
             "edges_total": edges_written,
-            "truncated": truncated,
+            "truncated": truncated or resolve_truncated,
+            "local": {"resolved": len(resolved), "unresolved": unresolved},
         }
+
+    @staticmethod
+    def _add_local_specs(local_papers, resolved, nodes, edges) -> None:
+        """A node per local paper; a SAME_AS edge to its matched OpenAlex work."""
+        for paper in local_papers:
+            key = paper["id"]
+            nodes[key] = NodeSpec("paper", key, paper.get("title") or "",
+                                  {"origin": "local", "year": paper.get("year")})
+            if key in resolved:
+                work, similarity, matched_on = resolved[key]
+                target = short_id(work["id"])
+                edges[(key, target, "SAME_AS")] = EdgeSpec(
+                    key, target, "SAME_AS", similarity, {"matched_on": matched_on}
+                )
 
     @staticmethod
     def _most_shared_references(seeds: list[dict], exclude: set) -> list[str]:
@@ -82,24 +121,38 @@ class KGIngestService:
         return ranked[:MAX_PRIOR_WORKS]
 
     @staticmethod
-    def _fetch_citing(api, seed_ids, start, exclude) -> tuple[list[dict], bool]:
-        """Citing works per seed, in a pool, until the build budget runs out.
+    def _fetch_citing(api, seed_ids, deadline, exclude) -> tuple[list[dict], bool]:
+        """Citing works per seed, in a pool, until the build deadline passes.
 
         Workers only call OpenAlex (no ORM). Returns (works, truncated).
         """
+        def expired():
+            return time.monotonic() >= deadline
+
+        def fetch(seed):
+            # Queued calls re-check the clock: submit returns at once, so the
+            # pre-submit check alone would let every queued call run.
+            if expired():
+                return None
+            return api.get_citing_works([seed], limit=PER_SEED_CITERS)
+
         truncated = False
         futures = []
         with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
             for seed in seed_ids:
-                if time.monotonic() - start >= BUILD_BUDGET_SECONDS:
+                if expired():
                     truncated = True
                     break
-                futures.append(pool.submit(api.get_citing_works, [seed], limit=PER_SEED_CITERS))
+                futures.append(pool.submit(fetch, seed))
 
         works: dict[str, dict] = {}
         seeds_cited = Counter()
         for future in futures:
-            for work in future.result():  # re-raises OpenAlexAPIError from the worker
+            result = future.result()  # re-raises OpenAlexAPIError from the worker
+            if result is None:
+                truncated = True
+                continue
+            for work in result:
                 key = short_id(work.get("id") or "")
                 if not key or key in exclude:
                     continue
@@ -163,8 +216,13 @@ class KGIngestService:
             })
 
     @staticmethod
-    def _write(nodes: dict, edges: dict) -> int:
-        """Upsert nodes then edges in one transaction; returns edges written."""
+    def _write(nodes: dict, edges: dict, replace_same_as: set = frozenset()) -> int:
+        """Upsert nodes then edges in one transaction; returns edges written.
+
+        The stored SAME_AS edges of the local papers in ``replace_same_as`` (the
+        ones searched in this build) are deleted first, so a new match replaces
+        an old one and "not found" removes it.
+        """
         stubs = [n for n in nodes.values() if n.is_stub]
         hydrated = [n for n in nodes.values() if not n.is_stub]
 
@@ -183,18 +241,30 @@ class KGIngestService:
             # Re-read: objects returned by bulk_create(ignore_conflicts=True) have no PK.
             all_keys = {k for s in edges.values() for k in (s.source_key, s.target_key)}
             ids = dict(KGNode.objects.filter(key__in=all_keys).values_list("key", "id"))
+            if replace_same_as:
+                KGEdge.objects.filter(
+                    edge_type="SAME_AS", source__key__in=replace_same_as
+                ).delete()
             rows = [
                 KGEdge(source_id=ids[s.source_key], target_id=ids[s.target_key],
                        edge_type=s.edge_type, weight=s.weight,
-                       properties=dict(s.properties), provenance="openalex")
+                       properties=dict(s.properties),
+                       provenance=(LOCAL_MATCH_PROVENANCE if s.edge_type == "SAME_AS"
+                                   else "openalex"))
                 for s in edges.values()
                 if s.source_key in ids and s.target_key in ids
             ]
-            KGEdge.objects.bulk_create(
-                rows,
-                update_conflicts=True,
-                unique_fields=["source", "target", "edge_type"],
-                update_fields=["weight", "properties", "provenance"],
-                batch_size=EDGE_BATCH,
-            )
+            # An edge with empty properties (e.g. CITES to a paper that is only a
+            # stub in this build) must not wipe properties an earlier build stored.
+            with_props = [r for r in rows if r.properties]
+            without_props = [r for r in rows if not r.properties]
+            for batch, fields in ((with_props, ["weight", "properties", "provenance"]),
+                                  (without_props, ["weight", "provenance"])):
+                KGEdge.objects.bulk_create(
+                    batch,
+                    update_conflicts=True,
+                    unique_fields=["source", "target", "edge_type"],
+                    update_fields=fields,
+                    batch_size=EDGE_BATCH,
+                )
         return len(rows)

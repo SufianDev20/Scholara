@@ -1,0 +1,73 @@
+{
+  "collected": "2026-11-15",
+  "query": "scholarly knowledge graph",
+  "paper_ids": [
+    {
+      "id": "W4388144113",
+      "title": "SemOpenAlex: The Scientific Landscape in 26 Billion RDF Triples"
+    },
+    {
+      "id": "W2572147858",
+      "title": "Towards a Definition of Knowledge Graphs."
+    },
+    {
+      "id": "W2983050946",
+      "title": "Open Research Knowledge Graph: Next Generation Infrastructure for Semantic Scholarly Knowledge"
+    },
+    {
+      "id": "W3112005222",
+      "title": "Improving Access to Scientific Literature with Knowledge Graphs"
+    },
+    {
+      "id": "W4291745514",
+      "title": "Scholarly knowledge graphs through structuring scholarly communication: a review"
+    },
+    {
+      "id": "W2981120761",
+      "title": "The Microsoft Academic Knowledge Graph: A Linked Data Source with 8 Billion Triples of Scholarly Data"
+    },
+    {
+      "id": "W3097858486",
+      "title": "Generating knowledge graphs by employing Natural Language Processing and Machine Learning techniques within the scholarly domain"
+    },
+    {
+      "id": "W3176869355",
+      "title": "Trans4E: Link prediction on scholarly knowledge graphs"
+    },
+    {
+      "id": "W2965641629",
+      "title": "Open Research Knowledge Graph: Next Generation Infrastructure for Semantic Scholarly Knowledge"
+    },
+    {
+      "id": "W3034244510",
+      "title": "Web of Scholars: A Scholar Knowledge Graph"
+    }
+  ],
+  "local_papers": [
+    {
+      "id": "local:2021.semeval-1.61.pdf",
+      "title": "INNOVATORS at S em E val-2021 Task-11: A Dependency Parsing and BERT -based model for Extracting Contribution Knowledge from Scientific Papers",
+      "year": 2021
+    },
+    {
+      "id": "local:acl_extra_1432.pdf",
+      "title": "Do We Need Bigger Models for Science? Task-Aware Retrieval with Small Language Models",
+      "year": 2026
+    },
+    {
+      "id": "local:2026.nslp-1.8.pdf",
+      "title": "Comparing LLM -Based Knowledge Graph Extraction Approaches on Literary Studies in S panish: A Case Study on Orbis Tertius",
+      "year": 2026
+    },
+    {
+      "id": "local:2021.acl-demo.14.pdf",
+      "title": "ESRA : Explainable Scientific Research Assistant",
+      "year": 2021
+    },
+    {
+      "id": "local:2021.acl-demo.6.pdf",
+      "title": "S ci C oncept M iner: A system for large-scale scientific concept discovery",
+      "year": 2021
+    }
+  ]
+}

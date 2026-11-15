@@ -1,6 +1,9 @@
+import re
+
 from rest_framework import serializers
 from .models import ModelPerformance, QueryLog, ModelReliability, ResponseLog
 from .services.extract_service import MAX_PDF_CANDIDATES
+from .services.kg_mapper import short_id
 
 # Stricter than pdf_service.MAX_PDF_URL_LENGTH (2000): this is an early
 # request-validation cap, not the SSRF-guard's hard safety limit.
@@ -132,5 +135,96 @@ class QARequestSerializer(serializers.Serializer):
         if missing:
             raise serializers.ValidationError(
                 {"pdf_urls": f"Missing pdf_url for paper_id(s): {missing}"}
+            )
+        return attrs
+
+
+MAX_GRAPH_SEEDS = 25
+MAX_LOCAL_PAPERS = 10
+LOCAL_ID_PREFIX = "local:"
+LOCAL_ID_MAX_LENGTH = 120  # KGNode.key max_length
+OPENALEX_WORK_ID_RE = re.compile(r"^(https://openalex\.org/)?W\d+$")
+
+
+def normalise_work_ids(values):
+    """Validate OpenAlex work IDs, return short keys with duplicates removed in order.
+
+    Raises serializers.ValidationError naming the first bad ID. Shared by
+    KGBuildRequestSerializer and the subgraph view's `ids` parameter.
+    """
+    for value in values:
+        if not OPENALEX_WORK_ID_RE.match(value):
+            raise serializers.ValidationError(
+                f"Not an OpenAlex work ID: {value!r}"
+            )
+    return list(dict.fromkeys(short_id(v) for v in values))
+
+
+def _check_local_id(value):
+    if not value.startswith(LOCAL_ID_PREFIX) or value == LOCAL_ID_PREFIX:
+        raise serializers.ValidationError(f"Not a local paper ID: {value!r}")
+    if len(value) > LOCAL_ID_MAX_LENGTH:
+        raise serializers.ValidationError(
+            f"Local paper ID longer than {LOCAL_ID_MAX_LENGTH} characters: {value[:40]!r}..."
+        )
+    return value
+
+
+def normalise_graph_ids(values):
+    """Subgraph `ids`: OpenAlex work IDs (normalised) or `local:` paper IDs, deduplicated in order."""
+    keys = []
+    for value in values:
+        if value.startswith(LOCAL_ID_PREFIX):
+            keys.append(_check_local_id(value))
+        else:
+            keys.extend(normalise_work_ids([value]))
+    return list(dict.fromkeys(keys))
+
+
+class LocalPaperSerializer(serializers.Serializer):
+    """One local-corpus paper: the university server sends no DOI or OpenAlex ID."""
+
+    id = serializers.CharField()
+    title = serializers.CharField(max_length=500, allow_blank=True)
+    year = serializers.IntegerField(allow_null=True)
+
+    def validate_id(self, value):
+        return _check_local_id(value)
+
+
+class KGBuildRequestSerializer(serializers.Serializer):
+    """Validate a knowledge graph build request (views_graph.graph_build)."""
+
+    paper_ids = serializers.ListField(
+        child=serializers.CharField(min_length=1),
+        required=False,
+        default=list,
+        max_length=MAX_GRAPH_SEEDS,
+        help_text="OpenAlex work IDs of the seed papers (0-25).",
+    )
+    local_papers = serializers.ListField(
+        child=LocalPaperSerializer(),
+        required=False,
+        default=list,
+        max_length=MAX_LOCAL_PAPERS,
+        help_text='Local-corpus papers {"id": "local:...", "title", "year"} (0-10).',
+    )
+
+    def validate_paper_ids(self, value):
+        return normalise_work_ids(value)
+
+    def validate_local_papers(self, value):
+        unique = {}
+        for paper in value:
+            unique.setdefault(paper["id"], dict(paper))
+        return list(unique.values())
+
+    def validate(self, attrs):
+        total = len(attrs["paper_ids"]) + len(attrs["local_papers"])
+        if total == 0:
+            raise serializers.ValidationError("Send paper_ids, local_papers or both.")
+        if total > MAX_GRAPH_SEEDS:
+            raise serializers.ValidationError(
+                f"At most {MAX_GRAPH_SEEDS} papers in paper_ids and local_papers combined."
             )
         return attrs

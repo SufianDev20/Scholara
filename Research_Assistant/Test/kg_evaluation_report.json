@@ -1,0 +1,526 @@
+{
+  "date": "2026-11-15",
+  "commit": "b97eb7f + uncommitted changes",
+  "seeds": {
+    "collected": "2026-11-15",
+    "query": "scholarly knowledge graph",
+    "paper_ids": [
+      {
+        "id": "W4388144113",
+        "title": "SemOpenAlex: The Scientific Landscape in 26 Billion RDF Triples"
+      },
+      {
+        "id": "W2572147858",
+        "title": "Towards a Definition of Knowledge Graphs."
+      },
+      {
+        "id": "W2983050946",
+        "title": "Open Research Knowledge Graph: Next Generation Infrastructure for Semantic Scholarly Knowledge"
+      },
+      {
+        "id": "W3112005222",
+        "title": "Improving Access to Scientific Literature with Knowledge Graphs"
+      },
+      {
+        "id": "W4291745514",
+        "title": "Scholarly knowledge graphs through structuring scholarly communication: a review"
+      },
+      {
+        "id": "W2981120761",
+        "title": "The Microsoft Academic Knowledge Graph: A Linked Data Source with 8 Billion Triples of Scholarly Data"
+      },
+      {
+        "id": "W3097858486",
+        "title": "Generating knowledge graphs by employing Natural Language Processing and Machine Learning techniques within the scholarly domain"
+      },
+      {
+        "id": "W3176869355",
+        "title": "Trans4E: Link prediction on scholarly knowledge graphs"
+      },
+      {
+        "id": "W2965641629",
+        "title": "Open Research Knowledge Graph: Next Generation Infrastructure for Semantic Scholarly Knowledge"
+      },
+      {
+        "id": "W3034244510",
+        "title": "Web of Scholars: A Scholar Knowledge Graph"
+      }
+    ],
+    "local_papers": [
+      {
+        "id": "local:2021.semeval-1.61.pdf",
+        "title": "INNOVATORS at S em E val-2021 Task-11: A Dependency Parsing and BERT -based model for Extracting Contribution Knowledge from Scientific Papers",
+        "year": 2021
+      },
+      {
+        "id": "local:acl_extra_1432.pdf",
+        "title": "Do We Need Bigger Models for Science? Task-Aware Retrieval with Small Language Models",
+        "year": 2026
+      },
+      {
+        "id": "local:2026.nslp-1.8.pdf",
+        "title": "Comparing LLM -Based Knowledge Graph Extraction Approaches on Literary Studies in S panish: A Case Study on Orbis Tertius",
+        "year": 2026
+      },
+      {
+        "id": "local:2021.acl-demo.14.pdf",
+        "title": "ESRA : Explainable Scientific Research Assistant",
+        "year": 2021
+      },
+      {
+        "id": "local:2021.acl-demo.6.pdf",
+        "title": "S ci C oncept M iner: A system for large-scale scientific concept discovery",
+        "year": 2021
+      }
+    ]
+  },
+  "rows": [
+    {
+      "id": "E1a",
+      "metric": "Reference coverage vs Crossref",
+      "value": 1.0260912341831279,
+      "display": "1.026",
+      "covered": "8 of 11 seeds with a DOI",
+      "target": ">= 0.7",
+      "verdict": "met",
+      "why": null
+    },
+    {
+      "id": "E1b",
+      "metric": "Reference coverage vs OpenCitations",
+      "value": 1.7576711810560068,
+      "display": "1.758",
+      "covered": "8 of 11 seeds with a DOI",
+      "target": "none",
+      "verdict": "reported",
+      "why": null
+    },
+    {
+      "id": "E2",
+      "metric": "Citation agreement with OpenCitations",
+      "value": 0.8089887640449438,
+      "display": "0.809",
+      "covered": "89 of 100 sampled edges; 36 of 42 citing papers",
+      "target": ">= 0.9",
+      "verdict": "missed",
+      "why": "OpenAlex and OpenCitations resolve references independently; a reference matched to a different version of the same work (preprint vs published DOI) counts as disagreement."
+    },
+    {
+      "id": "E3",
+      "metric": "Topic coherence of SIMILAR_TO / random baseline",
+      "value": 1.3608247422680413,
+      "display": "1.361 (0.439 vs random 0.322)",
+      "covered": "301 of 301 SIMILAR_TO pairs",
+      "target": ">= 1.5 x random",
+      "verdict": "missed",
+      "why": "SIMILAR_TO pairs share a subfield less than 1.5 times as often as random pairs; with few seeds the links can be dominated by weak co-citation pairs (two papers cited by the same single seed score 1.0)."
+    },
+    {
+      "id": "E4",
+      "metric": "Precision@5 against OpenAlex related_works",
+      "value": 0.11000000000000001,
+      "display": "0.110",
+      "covered": "10 of 12 seeds",
+      "target": "none",
+      "verdict": "reported",
+      "why": null
+    },
+    {
+      "id": "E5a",
+      "metric": "Papers with >= 1 author",
+      "value": 1.0,
+      "display": "1.000",
+      "covered": "112 hydrated papers",
+      "target": ">= 0.9",
+      "verdict": "met",
+      "why": null
+    },
+    {
+      "id": "E5b",
+      "metric": "Papers with >= 1 institution (via an author)",
+      "value": 0.9196428571428571,
+      "display": "0.920",
+      "covered": "112 hydrated papers",
+      "target": "none",
+      "verdict": "reported",
+      "why": null
+    },
+    {
+      "id": "E5c",
+      "metric": "Papers with a venue",
+      "value": 0.9464285714285714,
+      "display": "0.946",
+      "covered": "112 hydrated papers",
+      "target": "none",
+      "verdict": "reported",
+      "why": null
+    },
+    {
+      "id": "E5d",
+      "metric": "Papers with >= 1 topic",
+      "value": 1.0,
+      "display": "1.000",
+      "covered": "112 hydrated papers",
+      "target": ">= 0.9",
+      "verdict": "met",
+      "why": null
+    },
+    {
+      "id": "E5e",
+      "metric": "Authors with an ORCID",
+      "value": 0.8226600985221675,
+      "display": "0.823",
+      "covered": "406 authors",
+      "target": "none",
+      "verdict": "reported",
+      "why": null
+    },
+    {
+      "id": "E6",
+      "metric": "Local resolution rate (title match)",
+      "value": 0.4,
+      "display": "0.400",
+      "covered": "2 of 5 local papers (2 title+year); no DOI path",
+      "target": "none",
+      "verdict": "reported",
+      "why": null
+    },
+    {
+      "id": "E7a",
+      "metric": "Papers in scope",
+      "value": 117,
+      "display": "117 (112 OpenAlex, 5 local)",
+      "covered": "12 OpenAlex seeds",
+      "target": "none",
+      "verdict": "reported",
+      "why": null
+    },
+    {
+      "id": "E7b",
+      "metric": "Edges by type",
+      "value": 3065,
+      "display": "AFFILIATED_WITH 517, AUTHORED_BY 519, CITES 440, HAS_KEYWORD 844, HAS_TOPIC 336, PUBLISHED_IN 106, SAME_AS 2, SIMILAR_TO 301",
+      "covered": "scope",
+      "target": "none",
+      "verdict": "reported",
+      "why": null
+    },
+    {
+      "id": "E7c",
+      "metric": "Stub share (stubs cited by scope papers)",
+      "value": 0.9829993928354585,
+      "display": "0.983",
+      "covered": "6476 stubs, 112 hydrated",
+      "target": "none",
+      "verdict": "reported",
+      "why": null
+    },
+    {
+      "id": "E7d",
+      "metric": "Share of papers in largest weakly connected CITES component",
+      "value": 0.9910714285714286,
+      "display": "0.991",
+      "covered": "112 hydrated papers",
+      "target": "none",
+      "verdict": "reported",
+      "why": null
+    },
+    {
+      "id": "E7e",
+      "metric": "Stored citers per seed (min / median / max)",
+      "value": 7.5,
+      "display": "0 / 7.5 / 17",
+      "covered": "12 seeds",
+      "target": "none",
+      "verdict": "reported",
+      "why": null
+    },
+    {
+      "id": "E7f",
+      "metric": "Share of SIMILAR_TO from co-citation",
+      "value": 0.9435215946843853,
+      "display": "0.944",
+      "covered": "284 of 301 SIMILAR_TO edges",
+      "target": "none",
+      "verdict": "reported",
+      "why": null
+    },
+    {
+      "id": "E8a",
+      "metric": "Build time, median of 3 (s)",
+      "value": 15.956517399999939,
+      "display": "15.96",
+      "covered": "3 runs; 0 truncated",
+      "target": "<= 15.0",
+      "verdict": "missed",
+      "why": "OpenAlex responded slowly during the run; pyalex sets no request timeout, so one slow call stretches the build."
+    },
+    {
+      "id": "E8b",
+      "metric": "OpenAlex calls per build, median of 3",
+      "value": 19,
+      "display": "19 / 19 / 19 (median 19)",
+      "covered": "3 runs",
+      "target": "none",
+      "verdict": "reported",
+      "why": null
+    },
+    {
+      "id": "E8c",
+      "metric": "Subgraph time, median of 3 (s)",
+      "value": 0.8897322999998778,
+      "display": "0.89",
+      "covered": "3 runs",
+      "target": "<= 2.0",
+      "verdict": "met",
+      "why": null
+    },
+    {
+      "id": "E9",
+      "metric": "Rebuild stability (node + edge rows changed by a 2nd build)",
+      "value": 0,
+      "display": "nodes 7930 -> 7930, edges 10811 -> 10811",
+      "covered": "table-wide row counts",
+      "target": "identical",
+      "verdict": "met",
+      "why": null
+    }
+  ],
+  "details": {
+    "reference_coverage": [
+      {
+        "id": "W4388144113",
+        "doi": "10.1007/978-3-031-47243-5_6",
+        "kg_cites": 47,
+        "crossref": 58,
+        "opencitations": 38
+      },
+      {
+        "id": "W2983050946",
+        "doi": "10.1145/3360901.3364435",
+        "kg_cites": 24,
+        "crossref": 24,
+        "opencitations": 14
+      },
+      {
+        "id": "W3112005222",
+        "doi": "10.1515/bfp-2020-2042",
+        "kg_cites": 11,
+        "crossref": 12,
+        "opencitations": 9
+      },
+      {
+        "id": "W4291745514",
+        "doi": "10.1007/s40747-022-00806-6",
+        "kg_cites": 114,
+        "crossref": 129,
+        "opencitations": 97
+      },
+      {
+        "id": "W2981120761",
+        "doi": "10.1007/978-3-030-30796-7_8",
+        "kg_cites": 28,
+        "crossref": 25,
+        "opencitations": 23
+      },
+      {
+        "id": "W3097858486",
+        "doi": "10.1016/j.future.2020.10.026",
+        "kg_cites": 64,
+        "crossref": 49,
+        "opencitations": 27
+      },
+      {
+        "id": "W3176869355",
+        "doi": "10.1016/j.neucom.2021.02.100",
+        "kg_cites": 75,
+        "crossref": 64,
+        "opencitations": 24
+      },
+      {
+        "id": "W2965641629",
+        "doi": "10.15488/18962",
+        "kg_cites": 49,
+        "crossref": null,
+        "opencitations": 0
+      },
+      {
+        "id": "W3034244510",
+        "doi": "10.1145/3397271.3401405",
+        "kg_cites": 2,
+        "crossref": 2,
+        "opencitations": 1
+      },
+      {
+        "id": "W7166556907",
+        "doi": "10.63317/2cuutd9tnnhp",
+        "kg_cites": 0,
+        "crossref": 0,
+        "opencitations": 0
+      },
+      {
+        "id": "W3173621131",
+        "doi": "10.18653/v1/2021.acl-demo.14",
+        "kg_cites": 26,
+        "crossref": 0,
+        "opencitations": 0
+      }
+    ],
+    "citation_agreement": {
+      "sampled_edges": 100,
+      "measured_edges": 89,
+      "agreeing_edges": 72,
+      "disagreeing_edges": [
+        [
+          "10.1007/978-3-031-47243-5_6",
+          "10.48550/arxiv.2205.01833"
+        ],
+        [
+          "10.1007/s00778-022-00747-z",
+          "10.1109/tkde.2017.2754499"
+        ],
+        [
+          "10.1007/s40747-022-00806-6",
+          "10.17863/cam.48429"
+        ],
+        [
+          "10.1016/j.future.2020.10.026",
+          "10.1007/978-3-030-00668-6_8"
+        ],
+        [
+          "10.1016/j.future.2020.10.026",
+          "10.1007/978-3-030-61244-3_16"
+        ],
+        [
+          "10.1016/j.future.2020.10.026",
+          "10.1007/978-3-319-47602-5_18"
+        ],
+        [
+          "10.1016/j.future.2020.10.026",
+          "10.1045/november2012-knoth"
+        ],
+        [
+          "10.1016/j.future.2020.10.026",
+          "10.15488/18962"
+        ],
+        [
+          "10.1016/j.neucom.2021.02.100",
+          "10.1007/978-3-030-00668-6_8"
+        ],
+        [
+          "10.1016/j.neucom.2021.02.100",
+          "10.1007/978-3-030-62466-8_9"
+        ],
+        [
+          "10.1016/j.neucom.2021.02.100",
+          "10.1145/3360901.3364435"
+        ],
+        [
+          "10.1109/tai.2021.3076021",
+          "10.1109/tnnls.2021.3070843"
+        ],
+        [
+          "10.1145/3447772",
+          "10.1007/978-3-030-30796-7_8"
+        ],
+        [
+          "10.1145/3447772",
+          "10.17863/cam.48429"
+        ],
+        [
+          "10.18653/v1/n18-3011",
+          "10.1145/1871437.1871689"
+        ],
+        [
+          "10.18653/v1/n18-3011",
+          "10.18653/v1/s17-2091"
+        ],
+        [
+          "10.3390/info15080509",
+          "10.1007/978-3-031-19433-7_39"
+        ]
+      ]
+    },
+    "topic_coherence": {
+      "similar_to": 0.43853820598006643,
+      "random_baseline": 0.3222591362126246,
+      "pairs": 301,
+      "random_pairs": 301
+    },
+    "precision_at_5": {
+      "W4388144113": 0.5,
+      "W2572147858": 0.0,
+      "W2983050946": 0.2,
+      "W3112005222": 0.0,
+      "W4291745514": null,
+      "W2981120761": 0.0,
+      "W3097858486": 0.2,
+      "W3176869355": 0.0,
+      "W2965641629": 0.2,
+      "W3034244510": 0.0,
+      "W7166556907": null,
+      "W3173621131": 0.0
+    },
+    "edges_by_type": {
+      "AFFILIATED_WITH": 517,
+      "AUTHORED_BY": 519,
+      "CITES": 440,
+      "HAS_KEYWORD": 844,
+      "HAS_TOPIC": 336,
+      "PUBLISHED_IN": 106,
+      "SAME_AS": 2,
+      "SIMILAR_TO": 301
+    },
+    "stored_citers_per_seed": {
+      "W4388144113": 0,
+      "W2572147858": 13,
+      "W2983050946": 17,
+      "W3112005222": 5,
+      "W4291745514": 2,
+      "W2981120761": 12,
+      "W3097858486": 12,
+      "W3176869355": 9,
+      "W2965641629": 8,
+      "W3034244510": 7,
+      "W7166556907": 0,
+      "W3173621131": 0
+    }
+  },
+  "manual_check_sheet": [
+    {
+      "local_id": "local:2021.acl-demo.14.pdf",
+      "local_title": "ESRA : Explainable Scientific Research Assistant",
+      "local_year": 2021,
+      "local_authors": "not sent by the research server",
+      "openalex_id": "W3173621131",
+      "openalex_title": "ESRA: Explainable Scientific Research Assistant",
+      "openalex_year": 2021,
+      "openalex_authors": "Aik Beng Ng, Pasit Laohawarutchai, Peeranuth Kehasukcharoen, Peerapon Vateekul, Piyawat Lertvittayakumjorn, Pollawat Hongwimol, Timothy Liu, Zhangsheng Lai",
+      "matched_on": "title+year",
+      "similarity": 1.0,
+      "correct": ""
+    },
+    {
+      "local_id": "local:acl_extra_1432.pdf",
+      "local_title": "Do We Need Bigger Models for Science? Task-Aware Retrieval with Small Language Models",
+      "local_year": 2026,
+      "local_authors": "not sent by the research server",
+      "openalex_id": "W7166556907",
+      "openalex_title": "Do We Need Bigger Models for Science? Task-Aware Retrieval with Small Language Models",
+      "openalex_year": 2026,
+      "openalex_authors": "Florian Kelber, Matthias Jobst, Michael Färber, Yuni Susanti",
+      "matched_on": "title+year",
+      "similarity": 1.0,
+      "correct": ""
+    }
+  ],
+  "known_limits": [
+    "OpenAlex only keeps references it can match to a work, so CITES edges miss references to books, web pages and unindexed venues.",
+    "Similarity needs shared references, so very new papers get few SIMILAR_TO links.",
+    "Co-citation is limited to PER_SEED_CITERS = 10 stored citers per seed, so SIMILAR_TO is mostly bibliographic coupling.",
+    "Co-citation gives 1.0 to two papers cited only by the same single seed (1/sqrt(1*1)), so with few seeds SIMILAR_TO among prior works can be dominated by weak co-citation links (a minimum shared count of 2 would fix it).",
+    "Local papers without a title match stay unconnected.",
+    "Local matching is title+year only: the research server sends no DOI.",
+    "Local papers have no CITES edges of their own; they reach the graph only through SAME_AS."
+  ]
+}

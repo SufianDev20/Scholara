@@ -473,6 +473,69 @@ These require a valid Clerk token (`Authorization: Bearer <token>`).
 - **Model Details**: `GET /api/performance/model/?model_name=<model>`
 - **Model Comparison**: `GET /api/performance/compare/?models=<model1,model2>`
 
+## Knowledge Graph
+
+The backend can turn seed papers into a citation and metadata graph (papers, authors, institutions, venues, topics, keywords). A build reads OpenAlex works for the seeds and their references and citing papers, and stores them as `KGNode` / `KGEdge` rows. Both endpoints need a Clerk token. Per user, builds are limited to 3 per minute and subgraph reads to 20 per minute.
+
+### Endpoints
+
+- **Build**: `POST /api/graph/build/` with 1-25 seeds in total. `local_papers` (max 10) are local-corpus results, linked to OpenAlex by title and year.
+
+  ```json
+  {"paper_ids": ["W4388144113"], "local_papers": [{"id": "local:2021.acl-demo.14.pdf", "title": "ESRA : Explainable Scientific Research Assistant", "year": 2021}]}
+  ```
+
+- **Subgraph**: `GET /api/graph/subgraph/?ids=W4388144113&edge_types=CITES,HAS_TOPIC&similarity=1&include_stubs=0`. Only `ids` is required. The response has the top-level keys `nodes`, `edges`, `prior_works`, `derivative_works` and `stats`. `SIMILAR_TO` links are entries in `edges`, and each paper node carries its Louvain cluster as `metrics.cluster`.
+
+### Schema
+
+```mermaid
+graph LR
+    Paper -->|CITES| Paper
+    Paper -->|AUTHORED_BY| Author
+    Author -->|AFFILIATED_WITH| Institution
+    Paper -->|PUBLISHED_IN| Venue
+    Paper -->|HAS_TOPIC| Topic
+    Paper -->|HAS_KEYWORD| Keyword
+    LocalPaper["Paper (local corpus)"] -->|SAME_AS| Paper
+```
+
+`SIMILAR_TO` edges (bibliographic coupling and co-citation) are computed when a subgraph is requested, not stored. A co-citation link needs at least 2 shared citing papers.
+
+### Evaluation
+
+`python manage.py evaluate_kg` checks the graph against Crossref, OpenCitations and OpenAlex. Results of the run on 2026-11-15 (12 OpenAlex seeds and 5 local papers; full report in `Research_Assistant/Test/kg_evaluation_report.md`):
+
+| # | Metric | Value | Covered | Target | Verdict |
+|---|---|---|---|---|---|
+| E1a | Reference coverage vs Crossref | 1.026 | 8 of 11 seeds with a DOI | >= 0.7 | met |
+| E1b | Reference coverage vs OpenCitations | 1.758 | 8 of 11 seeds with a DOI | none | reported |
+| E2 | Citation agreement with OpenCitations | 0.809 | 89 of 100 sampled edges; 36 of 42 citing papers | >= 0.9 | missed |
+| E3 | Topic coherence of SIMILAR_TO / random baseline | 1.361 (0.439 vs random 0.322) | 301 of 301 SIMILAR_TO pairs | >= 1.5 x random | missed |
+| E4 | Precision@5 against OpenAlex related_works | 0.110 | 10 of 12 seeds | none | reported |
+| E5a | Papers with >= 1 author | 1.000 | 112 hydrated papers | >= 0.9 | met |
+| E5b | Papers with >= 1 institution (via an author) | 0.920 | 112 hydrated papers | none | reported |
+| E5c | Papers with a venue | 0.946 | 112 hydrated papers | none | reported |
+| E5d | Papers with >= 1 topic | 1.000 | 112 hydrated papers | >= 0.9 | met |
+| E5e | Authors with an ORCID | 0.823 | 406 authors | none | reported |
+| E6 | Local resolution rate (title match) | 0.400 | 2 of 5 local papers (2 title+year); no DOI path | none | reported |
+| E7a | Papers in scope | 117 (112 OpenAlex, 5 local) | 12 OpenAlex seeds | none | reported |
+| E7b | Edges by type | AFFILIATED_WITH 517, AUTHORED_BY 519, CITES 440, HAS_KEYWORD 844, HAS_TOPIC 336, PUBLISHED_IN 106, SAME_AS 2, SIMILAR_TO 301 | scope | none | reported |
+| E7c | Stub share (stubs cited by scope papers) | 0.983 | 6476 stubs, 112 hydrated | none | reported |
+| E7d | Share of papers in largest weakly connected CITES component | 0.991 | 112 hydrated papers | none | reported |
+| E7e | Stored citers per seed (min / median / max) | 0 / 7.5 / 17 | 12 seeds | none | reported |
+| E7f | Share of SIMILAR_TO from co-citation | 0.944 | 284 of 301 SIMILAR_TO edges | none | reported |
+| E8a | Build time, median of 3 (s) | 15.96 | 3 runs; 0 truncated | <= 15.0 | missed |
+| E8b | OpenAlex calls per build, median of 3 | 19 / 19 / 19 (median 19) | 3 runs | none | reported |
+| E8c | Subgraph time, median of 3 (s) | 0.89 | 3 runs | <= 2.0 | met |
+| E9 | Rebuild stability (node + edge rows changed by a 2nd build) | nodes 7930 -> 7930, edges 10811 -> 10811 | table-wide row counts | identical | met |
+
+E2, E3 and E8a missed their targets. E2: OpenAlex and OpenCitations resolve references independently, so a reference matched to a different version of the same work (preprint vs published DOI) counts as disagreement. E3: with few seeds, `SIMILAR_TO` is dominated by weak co-citation pairs (two papers cited by the same single seed score 1.0). E8a: OpenAlex responded slowly during the run, and `pyalex` sets no request timeout.
+
+### Storage
+
+A build adds about 1,580 `KGNode` and 2,440 `KGEdge` rows per seed, mostly stub nodes (papers that are only cited). `python manage.py prune_kg_stubs` removes old single-citer stubs. Compare this figure with the storage limit of your Render Postgres plan before building many seeds.
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

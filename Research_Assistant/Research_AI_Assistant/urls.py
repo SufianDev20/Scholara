@@ -5,7 +5,7 @@ Django URL routing: https://docs.djangoproject.com/en/6.0/topics/http/urls/
 """
 
 from django.urls import path
-from . import views, views_performance
+from . import views, views_graph, views_performance
 from .views import multi_paper_qa
 
 # Add inside urlpatterns:
@@ -22,6 +22,8 @@ urlpatterns = [
     path("api/generate_title/", views.generate_title, name="generate_title"),
     path("api/openalex/authors/", views.search_authors, name="openalex_authors_search"),
     path("api/multi-paper-qa/", multi_paper_qa, name="multi_paper_qa"),
+    path("api/graph/build/", views_graph.graph_build, name="graph_build"),
+    path("api/graph/subgraph/", views_graph.graph_subgraph, name="graph_subgraph"),
     # Performance monitoring endpoints
     path(
         "api/performance/stats/",

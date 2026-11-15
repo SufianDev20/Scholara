@@ -22,7 +22,7 @@ db.sqlite3
 skills-lock.json
 # Editor folders
 .idea/
-
+kg_evaluation_report.md
 # OS files
 .DS_Store
 Thumbs.db
