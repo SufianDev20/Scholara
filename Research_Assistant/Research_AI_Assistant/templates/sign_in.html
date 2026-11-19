@@ -19,8 +19,22 @@
       <a class="si-brand" href="/">Scholara</a>
       <h1>Sign in to start researching</h1>
       <p class="si-sub">Continue with Google to open your research workspace.</p>
+      <p class="si-notice" id="siNotice" role="status" hidden></p>
       <div id="clerk-sign-in" aria-live="polite"></div>
       <p class="si-error" id="siError" hidden></p>
+      {% if guest_mode_enabled %}
+      <!-- Guest Mode: limited, temporary access without an account
+           (js/guest.js, views_guest.py). Hidden unless GUEST_MODE_ENABLED. -->
+      <div class="si-guest">
+        <p class="si-divider"><span>or</span></p>
+        <button type="button" class="si-guest__btn" id="siGuestBtn">Continue as guest</button>
+        <p class="si-guest__note" id="siGuestNote">
+          Try Scholara without an account: {{ guest_limits.searches }} searches,
+          {{ guest_limits.summaries }} summaries and {{ guest_limits.questions }} questions,
+          for {{ guest_limits.hours }} hours. Nothing is saved to binders.
+        </p>
+      </div>
+      {% endif %}
     </main>
     <script type="module" src="{% static 'js/sign_in.js' %}"></script>
   </body>

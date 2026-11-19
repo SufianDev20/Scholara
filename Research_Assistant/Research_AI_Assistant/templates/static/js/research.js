@@ -1,5 +1,29 @@
 import { DOMManager } from './core.js';
-import { MAX_ANALYZABLE_PAPERS, YEAR_MAX } from './constants.js';
+import { MAX_ANALYZABLE_PAPERS } from './constants.js';
+import { exhaustedMessage, guestErrorFrom, isGuestActive, maxSummaryPapers, remaining } from './guest.js';
+
+// Guest Mode: the server accepts at most maxSummaryPapers() papers per guest
+// summary; signed-in users are unaffected.
+function capForGuest(papers) {
+  return isGuestActive() ? papers.slice(0, maxSummaryPapers()) : papers;
+}
+
+// Guest Mode: an Error carrying a server (or known) guest refusal. Callers
+// show err.message as a friendly notice with a sign-in link, not "Error: ...".
+function guestError(guest, status) {
+  const err = new Error(guest.message);
+  err.guest = guest;
+  err.status = status || 403;
+  return err;
+}
+
+// A guest with none of `kind` left: refuse locally instead of sending a
+// request the server would certainly refuse.
+function guestQuotaSpent(kind) {
+  return isGuestActive() && remaining(kind) === 0
+    ? guestError({ code: "guest_quota_exhausted", message: exhaustedMessage(kind), quota: kind })
+    : null;
+}
 
 // Extend DOMManager prototype with research-related methods
 
@@ -8,25 +32,59 @@ import { MAX_ANALYZABLE_PAPERS, YEAR_MAX } from './constants.js';
 // ---------------------------------------------------------------------
 const ANALYSIS_SESSION_KEY = "scholara:analysisSession";
 
-function writeAnalysisSession({ binder, question, papers, selectedIds }) {
+// `session` is the Recents session the research came from (null for a saved
+// Binder). For a session the handoff also carries its earlier Paper Analysis
+// turns, so follow-ups asked before are shown again instead of being lost,
+// and `askOnOpen` tells analysis.js whether `question` is a new one to ask.
+function writeAnalysisSession({ binder, session, question, papers, selectedIds }, domManager) {
   const payload = {
     researchId: binder.id || null,
     sourceQuery: binder.name || question || "",
     question: question || "",
     papers: Array.isArray(papers) ? papers : [],
     selectedIds: Array.isArray(selectedIds) ? selectedIds.filter(Boolean) : [],
-    searchParams: window.appState.searchParams || null,
+    searchParams: (session && session.searchParams) || window.appState.searchParams || null,
     createdAt: Date.now(),
   };
+  if (session) {
+    // Explicit link back to Recents. A Binder saved from a session keeps the
+    // session's id (researchId), so researchId alone must never be used to
+    // route anything into Recents -- Binder handoffs don't carry this field.
+    payload.recentsSessionId = session.id;
+    payload.turns = Array.isArray(session.analysisTurns) ? session.analysisTurns : [];
+    payload.askOnOpen = !!question;
+  }
 
+  const write = () => sessionStorage.setItem(ANALYSIS_SESSION_KEY, JSON.stringify(payload));
   try {
-    sessionStorage.setItem(ANALYSIS_SESSION_KEY, JSON.stringify(payload));
+    write();
     return true;
   } catch (err) {
+    // Recents share this tab's storage quota. The handoff takes priority:
+    // shrink the Recents recovery copy to this session alone and retry.
+    if (domManager && domManager.isStorageQuotaError(err)) {
+      domManager.releaseRecentsStorage(session && session.id);
+      try {
+        write();
+        return true;
+      } catch (_retryErr) {
+        /* fall through to the original error handling */
+      }
+    }
     console.error("Could not hand off research session to the analysis page:", err);
     alert("Couldn't open the analysis page (storage unavailable). Please try again.");
     return false;
   }
+}
+
+// Saves where the user was (scroll, opened paper) before the full-page
+// navigation to Paper Analysis, so Back restores the same spot.
+function rememberPositionBeforeAnalysis(domManager, session, paper) {
+  if (!session) return;
+  domManager.captureActiveSessionUi();
+  session.lastOpenedPaperId = (paper && paper.openalex_id) || null;
+  domManager.saveResearchSessions(); // mark changed so the flush writes it
+  domManager.flushResearchSessions();
 }
 
 DOMManager.prototype.handleFollowUpQuestion = function() {
@@ -44,6 +102,7 @@ DOMManager.prototype.handleFollowUpQuestion = function() {
   if (!question || !window.appState.currentResearchBinder) return;
 
   const binder = window.appState.currentResearchBinder;
+  const session = this.sessionForBinder(binder);
   const papers = Array.isArray(binder.papers) ? binder.papers : [];
 
   const selectedIds = papers
@@ -51,7 +110,8 @@ DOMManager.prototype.handleFollowUpQuestion = function() {
     .slice(0, MAX_ANALYZABLE_PAPERS)
     .map((p) => p.openalex_id);
 
-  if (!writeAnalysisSession({ binder, question, papers, selectedIds })) return;
+  rememberPositionBeforeAnalysis(this, session, null);
+  if (!writeAnalysisSession({ binder, session, question, papers, selectedIds }, this)) return;
 
   if (input) input.value = "";
   window.location.href = "/analysis/";
@@ -60,12 +120,14 @@ DOMManager.prototype.handleFollowUpQuestion = function() {
 DOMManager.prototype.openAnalysisPage = function(papers, clickedIndex) {
   const binder = window.appState.currentResearchBinder;
   if (!binder) return;
+  const session = this.sessionForBinder(binder);
 
   const list = Array.isArray(papers) ? papers : [];
   const clicked = list[clickedIndex];
   const selectedIds = clicked && clicked.openalex_id ? [clicked.openalex_id] : [];
 
-  if (!writeAnalysisSession({ binder, question: "", papers: list, selectedIds })) return;
+  rememberPositionBeforeAnalysis(this, session, clicked);
+  if (!writeAnalysisSession({ binder, session, question: "", papers: list, selectedIds }, this)) return;
 
   window.location.href = "/analysis/";
 };
@@ -75,6 +137,8 @@ DOMManager.prototype.renderReferences = function(papers) {
     return;
 
   this.elements.referencesList.innerHTML = "";
+  // What the list currently shows; recents.js skips re-rendering identical lists.
+  this._renderedReferences = { papers: papers, filter: window.appState.currentFilter || "relevance" };
 
   // Always show the panel - display empty state if no papers
   this.elements.referencesPanel.style.display = "flex";
@@ -99,6 +163,8 @@ DOMManager.prototype.renderReferences = function(papers) {
       // (Enter/Space), the same as clicking the card.
       card.tabIndex = 0;
       card.title = "Open in Paper Analysis";
+      // Lets Back from Paper Analysis return focus to the paper opened.
+      if (paper && paper.openalex_id) card.dataset.paperId = paper.openalex_id;
 
       // Paper metadata is untrusted text: escape every value before innerHTML.
       var doiUrl = this.paperDoiUrl(paper && paper.doi);
@@ -185,6 +251,11 @@ DOMManager.prototype.setupFilterListeners = function() {
       filterBtns.forEach((b) => b.classList.remove("active"));
       btn.classList.add("active");
       window.appState.currentFilter = btn.dataset.filter;
+      const session = this.getActiveResearchSession();
+      if (session) {
+        session.currentFilter = btn.dataset.filter;
+        this.saveResearchSessions();
+      }
 
       if (window.appState.currentResearchBinder?.papers) {
         this.renderReferences(window.appState.currentResearchBinder.papers);
@@ -193,90 +264,83 @@ DOMManager.prototype.setupFilterListeners = function() {
   });
 };
 
+// Runs the search (once) and the summary for the research session on screen.
+//
+// Ownership: the session and its own chat container are captured up front.
+// Results always go into that session -- even if the user has since gone
+// Home or switched to another topic -- and shared controls (references,
+// load more, buttons, window.appState) are only touched while the session
+// is still the one on screen. A session whose search already returned
+// papers (summary retry after an error/interruption) skips the search.
 DOMManager.prototype.generateResearchResponse = async function() {
-  if (!window.appState.currentResearchBinder || window.appState.isThinking) return;
+  const binder = window.appState.currentResearchBinder;
+  const session = this.sessionForBinder(binder);
+  if (!session || session.pending.search) return;
 
-  const container = this.elements.researchChatContainer;
-  const sendBtn = this.elements.researchSendBtn;
+  const container = session.container;
+  const owns = () => this.ownsResearchView(binder);
 
-  window.appState.isThinking = true;
-  window.appState.isGeneratingResponse = true;
-  if (sendBtn) sendBtn.disabled = true;
-
-  // Hide reference filters during generation
-  this.setReferencesFilterVisibility(false);
+  session.pending.search = true;
+  session.status = "loading";
+  session.errorMessage = "";
+  session.loadMoreStatus = "";
+  this.syncResearchUi(session);
+  this.saveResearchSessions();
 
   const assistantDiv = this.addMessage("", false, container);
 
   // Loading state shown until the search + summary complete
-  assistantDiv.innerHTML = `
-        <div class="research-loading" role="status">
-            <span class="research-loading__label">
-                <span class="research-loading__pulse" aria-hidden="true"></span>
-                Finding papers and drafting a summary&hellip;
-            </span>
-            <span class="research-loading__lines" aria-hidden="true"><span></span><span></span><span></span></span>
-        </div>
-    `;
+  assistantDiv.innerHTML = this.loadingMessageHtml();
 
   try {
-    const lastUserQuery =
-      window.appState.currentResearchBinder.messages[
-        window.appState.currentResearchBinder.messages.length - 1
-      ].content;
+    const params = session.searchParams;
 
-    // Always search for papers with a new random seed for each query
-    const minYear = this.elements.yearMin?.value || null;
-    const maxYear =
-      this.elements.yearMax?.value ||
-      this.elements.yearFilter?.value ||
-      String(YEAR_MAX);
-    const sortPref = this.elements.searchBy?.value || "best_match";
-    const maxPapers = parseInt(this.elements.quota?.value || "5");
+    if (!session.searched) {
+      const searchData = await this.retrieveFromBackend(
+        params.query,
+        params.minYear,
+        params.maxYear,
+        params.mode,
+        params.perPage,
+      );
 
-    // Store search parameters for load more functionality
-    window.appState.searchParams = {
-      query: lastUserQuery,
-      mode: sortPref,
-      minYear: minYear,
-      maxYear: maxYear,
-      perPage: maxPapers,
-    };
+      // Store pagination info on the session (and globally while on screen)
+      session.nextCursor = searchData.next_cursor;
+      session.totalCount = searchData.total_count;
+      binder.papers = Array.isArray(searchData.papers) ? searchData.papers : [];
+      session.searched = true;
+      session.summaryPaperCount = binder.papers.length;
+      this.saveResearchSessions();
 
-    const searchData = await this.retrieveFromBackend(
-      lastUserQuery,
-      minYear,
-      maxYear,
-      sortPref,
-      maxPapers,
+      if (owns()) {
+        this.syncResearchUi(session);
+        this.renderReferences(binder.papers);
+      }
+
+      // A 200 response with zero papers is a valid, successful search that
+      // simply matched nothing — distinct from the search service being
+      // unavailable (handled in the catch block below). Report it as such
+      // and skip the summarise call: there is nothing to summarise.
+      if (binder.papers.length === 0) {
+        const noResultsMessage =
+          "No papers matched this search. Try different keywords, a broader year range, or a different search mode.";
+        assistantDiv.innerHTML = noResultsMessage;
+        assistantDiv.style.opacity = "1";
+        binder.messages = binder.messages.concat({
+          role: "assistant",
+          content: noResultsMessage,
+        });
+        session.status = "empty";
+        return;
+      }
+    }
+
+    const papersToUse = capForGuest(
+      binder.papers.slice(0, session.summaryPaperCount || binder.papers.length),
     );
 
-    // Store pagination info
-    window.appState.nextCursor = searchData.next_cursor;
-    window.appState.totalCount = searchData.total_count;
-
-    // Replace papers with new search results
-    window.appState.currentResearchBinder.papers = searchData.papers;
-    const papersToUse = searchData.papers;
-
-    this.renderReferences(papersToUse);
-
-    // A 200 response with zero papers is a valid, successful search that
-    // simply matched nothing — distinct from the search service being
-    // unavailable (handled in the catch block below). Report it as such
-    // and skip the summarise call: there is nothing to summarise.
-    if (!papersToUse || papersToUse.length === 0) {
-      const noResultsMessage =
-        "No papers matched this search. Try different keywords, a broader year range, or a different search mode.";
-      assistantDiv.innerHTML = noResultsMessage;
-      assistantDiv.style.opacity = "1";
-      window.appState.currentResearchBinder.messages.push({
-        role: "assistant",
-        content: noResultsMessage,
-      });
-      this.updatePaginationInfo();
-      return;
-    }
+    const spent = guestQuotaSpent("summary");
+    if (spent) throw spent;
 
     // Apply rate limiting before LLM call
     await this.waitForRateLimit();
@@ -288,174 +352,202 @@ DOMManager.prototype.generateResearchResponse = async function() {
           "X-CSRFToken": window.csrfToken,
       },
       body: JSON.stringify({
-        query: lastUserQuery,
+        query: params.query,
         papers: papersToUse,
       }),
     });
 
-    console.log("API response status:", response.status);
-
     if (!response.ok) {
-      const err = await response.json();
+      const err = await response.json().catch(() => ({}));
       console.error("API error response:", err);
+      const guest = guestErrorFrom(err);
+      if (guest) throw guestError(guest, response.status);
       throw new Error(err.error || `Summarise error ${response.status}`);
     }
 
     const data = await response.json();
-    console.log("API response data:", data);
     const summary = data.summary || "No summary returned.";
-    console.log("Generated summary length:", summary.length);
 
-    // Replace the "Generating response..." placeholder with the actual response
+    // Replace the loading placeholder with the actual response
     assistantDiv.innerHTML = this.markdownToHtml(summary);
     this.addPaperDetails(assistantDiv, papersToUse);
     assistantDiv.style.opacity = "1";
 
-    // Update UI with pagination info after response + papers are rendered
-    this.updatePaginationInfo();
-
-    window.appState.currentResearchBinder.messages.push({
+    binder.messages = binder.messages.concat({
       role: "assistant",
       content: summary,
     });
-
-    // Ensure load more visibility is refreshed after assistant response renders
-    this.updatePaginationInfo();
-
-    // Show save button for temporary binders
-    if (
-      this.elements.saveToBinderBtn &&
-      window.appState.currentResearchBinder?.id?.startsWith("temp-")
-    ) {
-      console.log("Showing save button for temporary binder");
-      this.elements.saveToBinderBtn.style.display = "block";
-    }
+    // "ready" also reveals Save to Binder (see syncResearchUi), as before.
+    session.status = "ready";
   } catch (err) {
+    if (this.isPageUnloading()) {
+      // The browser aborted the request because the page is going away.
+      // Keep "loading": on restore it becomes "interrupted" with a retry.
+      return;
+    }
     console.error("Error in generateResearchResponse:", err);
-    // Replace the "Generating response..." placeholder with the error
-    if (assistantDiv) {
-      assistantDiv.classList.add("message--error");
-      assistantDiv.textContent =
-        "Error: " + (err && err.message ? err.message : "Unknown error");
-      assistantDiv.style.opacity = "1";
-    }
-
-    // Show user-friendly error message but continue flow
-    if (this.elements.loadMoreStatus) {
-      this.elements.loadMoreStatus.textContent = `Error: ${err.message}`;
-    }
-
-    // Still update pagination info even on error to show correct state
-    this.updatePaginationInfo();
+    const message = err && err.message ? err.message : "Unknown error";
+    session.status = "error";
+    session.errorMessage = message;
+    // Guest Mode limits read as a friendly notice with a sign-in link.
+    session.errorGuest = !!(err && err.guest);
+    session.loadMoreStatus = session.errorGuest ? "" : `Error: ${message}`;
+    // Replace the loading placeholder with the error and an explicit retry
+    this.renderSessionNotice(session, assistantDiv, session.errorGuest ? message : "Error: " + message);
   } finally {
-    console.log(
-      "generateResearchResponse completed, setting isThinking to false",
-    );
-    window.appState.isThinking = false;
-    window.appState.isGeneratingResponse = false;
-    // Restore the follow-up Send button on both success and failure — it
-    // was only ever disabled to stop a follow-up being submitted while
-    // this request was in flight (see the isThinking guards above and in
-    // handleFollowUpQuestion), not meant to stay disabled afterwards.
-    if (sendBtn) sendBtn.disabled = false;
-    // Show reference filters only after generation completes
-    this.setReferencesFilterVisibility(true);
+    // Restores the follow-up Send button, reference filters, pagination and
+    // load more for this session -- only if it is still on screen.
+    session.pending.search = false;
+    this.saveResearchSessions();
+    this.syncResearchUi(session);
   }
 };
 
 DOMManager.prototype.loadMorePapers = async function() {
-  if (!window.appState.nextCursor || window.appState.isLoadingMore) return;
+  const binder = window.appState.currentResearchBinder;
+  if (!binder) return;
+  // Recents session, or null for a saved Binder opened from the Binders
+  // board (which keeps using the global pagination state, as before).
+  const session = this.sessionForBinder(binder);
+  const st = window.appState;
 
+  const cursor = session ? session.nextCursor : st.nextCursor;
+  const params = session ? session.searchParams : st.searchParams;
+  const busy = session ? session.pending.loadMore : st.isLoadingMore;
+  if (!cursor || busy) return;
+
+  const owns = () => this.ownsResearchView(binder);
   const btn = this.elements.loadMoreBtn;
   const status = this.elements.loadMoreStatus;
+  const container = session ? session.container : this.elements.researchChatContainer;
+  const setStatus = (text) => {
+    if (session) session.loadMoreStatus = text;
+    if (owns() && status) status.textContent = text;
+  };
+  const setBusy = (value) => {
+    if (session) {
+      session.pending.loadMore = value;
+      this.syncResearchUi(session);
+    } else {
+      st.isLoadingMore = value;
+      if (btn) btn.disabled = value;
+    }
+  };
 
   // searchParams is only set by a fresh search; without it the request below
   // would throw before any feedback reached the user.
-  if (!window.appState.searchParams?.query) {
-    if (status) status.textContent = "Error: search context lost. Run the search again.";
+  if (!params?.query) {
+    setStatus("Error: search context lost. Run the search again.");
     return;
   }
 
-  window.appState.isLoadingMore = true;
+  // Guest Mode: Load More counts as a search; skip a certain refusal.
+  const searchSpent = guestQuotaSpent("search");
+  if (searchSpent) {
+    setStatus(searchSpent.message);
+    return;
+  }
+
   let loadFailed = false;
   let firstNewNode = null;
 
-  if (btn) btn.disabled = true;
-  if (status) status.textContent = "Loading more papers...";
+  setStatus("Loading more papers...");
+  setBusy(true);
 
   // Ensure button remains visible during loading
-  if (this.elements.loadMoreContainer) {
+  if (owns() && this.elements.loadMoreContainer) {
     this.elements.loadMoreContainer.style.display = "flex";
   }
+
+  // Keeps a saved Binder in the binders array in step with its research view.
+  const syncSavedBinder = () => {
+    if (binder.id.startsWith("temp-")) return;
+    const binderIndex = st.binders.findIndex((b) => b.id === binder.id);
+    if (binderIndex !== -1) {
+      st.binders[binderIndex] = JSON.parse(JSON.stringify(binder));
+      this.renderBinders(); // Update binder display
+    }
+  };
 
   try {
     // Quota filter = number of NEW papers each Load More must add. Load More is
     // keyword search (semantic search can't paginate), so its order can repeat
     // papers already shown from the semantic first page; over-fetch (API max 50),
     // then drop shown ids and trim back to the quota below.
-    const quota = window.appState.searchParams?.perPage || 25;
+    const quota = params.perPage || 25;
     const perPage = Math.min(quota * 2, 50);
     let yearParams = "";
-    if (window.appState.searchParams && window.appState.searchParams.minYear) {
-      yearParams += `&min_year=${encodeURIComponent(window.appState.searchParams.minYear)}`;
+    if (params.minYear) {
+      yearParams += `&min_year=${encodeURIComponent(params.minYear)}`;
     }
-    if (window.appState.searchParams && window.appState.searchParams.maxYear) {
-      yearParams += `&max_year=${encodeURIComponent(window.appState.searchParams.maxYear)}`;
+    if (params.maxYear) {
+      yearParams += `&max_year=${encodeURIComponent(params.maxYear)}`;
     }
 
     const response = await fetch(
-      `/api/search/?q=${encodeURIComponent(window.appState.searchParams.query)}&mode=${window.appState.searchParams.mode}&cursor=${encodeURIComponent(window.appState.nextCursor)}&load_more=true&per_page=${perPage}${yearParams}`,
+      `/api/search/?q=${encodeURIComponent(params.query)}&mode=${params.mode}&cursor=${encodeURIComponent(cursor)}&load_more=true&per_page=${perPage}${yearParams}`,
     );
 
     if (!response.ok) {
       // Surface the server's own message (e.g. OpenAlex being unreachable)
       // rather than just the status code.
       let detail = "";
+      let guest = null;
       try {
         const errBody = await response.json();
         detail = errBody.error || errBody.detail || "";
+        guest = guestErrorFrom(errBody);
       } catch (_parseErr) {
         // Non-JSON body; the status code below is all we have.
       }
+      if (guest) throw guestError(guest, response.status);
       throw new Error(detail || `Load more error ${response.status}`);
     }
 
     const data = await response.json();
 
-    // Update cursor for next load
-    window.appState.nextCursor = data.next_cursor;
+    // Update cursor for next load -- on the session that asked for it.
+    if (session) session.nextCursor = data.next_cursor;
+    if (!session || owns()) st.nextCursor = data.next_cursor;
 
     // Drop papers already shown, then trim to the quota filter
-    const shownIds = new Set(
-      window.appState.currentResearchBinder.papers.map((p) => p.openalex_id),
-    );
+    const shownIds = new Set(binder.papers.map((p) => p.openalex_id));
     data.papers = (data.papers || [])
       .filter((p) => !shownIds.has(p.openalex_id))
       .slice(0, quota);
 
-    // Append new papers to the main papers array
-    window.appState.currentResearchBinder.papers.push(...data.papers);
+    // Append new papers. A new array (not push) so a Binder saved earlier
+    // from this session keeps its own paper list.
+    binder.papers = binder.papers.concat(data.papers);
+    if (session) this.saveResearchSessions();
 
-    this.renderReferences(window.appState.currentResearchBinder.papers);
+    if (owns()) this.renderReferences(binder.papers);
+    syncSavedBinder();
 
-    // Update the binder in the binders array if it's an existing binder
-    if (!window.appState.currentResearchBinder.id.startsWith("temp-")) {
-      const binderIndex = window.appState.binders.findIndex(
-        (b) => b.id === window.appState.currentResearchBinder.id,
-      );
-      if (binderIndex !== -1) {
-        // Update the binder in the array with current state
-        window.appState.binders[binderIndex] = JSON.parse(
-          JSON.stringify(window.appState.currentResearchBinder),
-        );
-        this.renderBinders(); // Update binder display
-      }
-    }
+    const appendSummary = (summary) => {
+      const labelDiv = document.createElement("div");
+      labelDiv.textContent = "Summary of Additional Papers";
+      labelDiv.className = "summary-label";
+      container.appendChild(labelDiv);
 
-    // Summarize additional papers
-    try {
+      const summaryDiv = this.addMessage("", false, container);
+      summaryDiv.innerHTML = this.markdownToHtml(summary);
+      this.addPaperDetails(summaryDiv, data.papers);
+      summaryDiv.style.opacity = "1";
+
+      // Also add summary to messages array for persistence
+      binder.messages = binder.messages.concat({
+        role: "assistant",
+        content: summary,
+      });
+      if (session) this.saveResearchSessions();
+      return labelDiv;
+    };
+
+    const requestSummary = async () => {
+      const summarySpent = guestQuotaSpent("summary");
+      if (summarySpent) throw summarySpent;
       await this.waitForRateLimit();
-
       const summariseResponse = await fetch("/api/summarise/", {
         method: "POST",
         headers: {
@@ -463,58 +555,26 @@ DOMManager.prototype.loadMorePapers = async function() {
             "X-CSRFToken": window.csrfToken,
         },
         body: JSON.stringify({
-          query: window.appState.searchParams.query,
-          papers: data.papers,
+          query: params.query,
+          papers: capForGuest(data.papers),
         }),
       });
-
       if (!summariseResponse.ok) {
-        const err = await summariseResponse.json();
+        const err = await summariseResponse.json().catch(() => ({}));
+        const guest = guestErrorFrom(err);
+        if (guest) throw guestError(guest, summariseResponse.status);
         throw new Error(
           err.error || `Summarise error ${summariseResponse.status}`,
         );
       }
-
       const summariseData = await summariseResponse.json();
-      const summary = summariseData.summary || "No summary returned.";
+      return summariseData.summary || "No summary returned.";
+    };
 
-      // Add label for summary
-      const labelDiv = document.createElement("div");
-      labelDiv.textContent = "Summary of Additional Papers";
-      labelDiv.className = "summary-label";
-      this.elements.researchChatContainer.appendChild(labelDiv);
-      firstNewNode = labelDiv;
-
-      // Add summary as assistant message
-      const summaryDiv = this.addMessage(
-        "",
-        false,
-        this.elements.researchChatContainer,
-      );
-      summaryDiv.innerHTML = this.markdownToHtml(summary);
-      this.addPaperDetails(summaryDiv, data.papers);
-      summaryDiv.style.opacity = "1";
-
-      // Also add summary to messages array for persistence
-      if (window.appState.currentResearchBinder) {
-        window.appState.currentResearchBinder.messages.push({
-          role: "assistant",
-          content: summary,
-        });
-
-        // Update binder in array if it's an existing binder
-        if (!window.appState.currentResearchBinder.id.startsWith("temp-")) {
-          const binderIndex = window.appState.binders.findIndex(
-            (b) => b.id === window.appState.currentResearchBinder.id,
-          );
-          if (binderIndex !== -1) {
-            window.appState.binders[binderIndex] = JSON.parse(
-              JSON.stringify(window.appState.currentResearchBinder),
-            );
-            this.renderBinders(); // Update binder display
-          }
-        }
-      }
+    // Summarize additional papers
+    try {
+      firstNewNode = appendSummary(await requestSummary());
+      syncSavedBinder();
     } catch (err) {
       console.warn("Summary of additional papers failed:", err);
 
@@ -528,55 +588,32 @@ DOMManager.prototype.loadMorePapers = async function() {
         <button type="button" class="summary-error-message__retry">Try Again</button>
       `;
       errorDiv.querySelector(".summary-error-message__detail").textContent = err.message;
-      this.elements.researchChatContainer.appendChild(errorDiv);
+      container.appendChild(errorDiv);
       firstNewNode = errorDiv;
 
+      // Guest Mode limit: retrying would be refused again; offer sign-in.
+      if (err.guest) {
+        errorDiv.querySelector(".summary-error-message__title").textContent = "Summary not available in guest mode";
+        const oldBtn = errorDiv.querySelector("button");
+        const signIn = document.createElement("a");
+        signIn.className = "summary-error-message__retry";
+        signIn.href = "/sign-in/";
+        signIn.textContent = "Sign in";
+        if (oldBtn) oldBtn.replaceWith(signIn);
+      }
+
       // Add retry functionality
-      const retryBtn = errorDiv.querySelector("button");
+      const retryBtn = err.guest ? null : errorDiv.querySelector("button");
       if (retryBtn) {
         retryBtn.onclick = async () => {
           retryBtn.textContent = "Retrying...";
           retryBtn.disabled = true;
           try {
-            await this.waitForRateLimit();
-
-            const retryResponse = await fetch("/api/summarise/", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "X-CSRFToken": window.csrfToken,
-              },
-              body: JSON.stringify({
-                query: window.appState.searchParams.query,
-                papers: data.papers,
-              }),
-            });
-
-            if (retryResponse.ok) {
-              const retryData = await retryResponse.json();
-              const summary = retryData.summary || "No summary returned.";
-
-              // Replace error message with successful summary
-              errorDiv.remove();
-
-              // Add label for summary
-              const labelDiv = document.createElement("div");
-              labelDiv.textContent = "Summary of Additional Papers";
-              labelDiv.className = "summary-label";
-              this.elements.researchChatContainer.appendChild(labelDiv);
-
-              // Add summary as assistant message
-              const summaryDiv = this.addMessage(
-                "",
-                false,
-                this.elements.researchChatContainer,
-              );
-              summaryDiv.innerHTML = this.markdownToHtml(summary);
-              this.addPaperDetails(summaryDiv, data.papers);
-              summaryDiv.style.opacity = "1";
-            } else {
-              throw new Error("Retry failed");
-            }
+            const summary = await requestSummary();
+            // Replace error message with successful summary
+            errorDiv.remove();
+            appendSummary(summary);
+            syncSavedBinder();
           } catch (retryErr) {
             retryBtn.textContent = "Retry Failed";
             retryBtn.disabled = false;
@@ -589,31 +626,26 @@ DOMManager.prototype.loadMorePapers = async function() {
       console.log("Load more flow continuing despite summary failure");
     }
 
-    // Update pagination info after successful load
-    this.updatePaginationInfo();
-
     // Show message if available (e.g., "No more papers available")
     if (data.message) {
       const messageDiv = document.createElement("div");
       messageDiv.textContent = data.message;
       messageDiv.className = "load-more-message";
-      this.elements.researchChatContainer.appendChild(messageDiv);
+      container.appendChild(messageDiv);
     }
   } catch (err) {
     console.error("Load more failed:", err);
     loadFailed = true;
-    if (status) status.textContent = `Error: ${err.message}`;
-    // Still update pagination info even on error to show correct state
-    this.updatePaginationInfo();
+    setStatus(err && err.guest ? err.message : `Error: ${err.message}`);
   } finally {
-    window.appState.isLoadingMore = false;
-    if (btn) btn.disabled = false;
     // Keep an error visible; only clear the "Loading..." text on success.
-    if (status && !loadFailed) status.textContent = "";
-    if (firstNewNode) firstNewNode.scrollIntoView({ behavior: "smooth", block: "start" });
-
-    // Final pagination update to ensure button visibility is correct
-    this.updatePaginationInfo();
+    if (!loadFailed) setStatus("");
+    setBusy(false);
+    if (owns()) {
+      if (firstNewNode) firstNewNode.scrollIntoView({ behavior: "smooth", block: "start" });
+      // Final pagination update to ensure button visibility is correct
+      this.updatePaginationInfo();
+    }
   }
 };
 
@@ -646,21 +678,24 @@ DOMManager.prototype.ensureElements = function() {
   }
 };
 
+// Renders pagination for the research view on screen (window.appState holds
+// the on-screen session's values; see syncResearchUi in recents.js).
 DOMManager.prototype.updatePaginationInfo = function() {
   // Ensure elements are available
   this.ensureElements();
+  const binder = window.appState.currentResearchBinder;
+  if (!binder) return;
 
-  const totalLoaded = window.appState.currentResearchBinder.papers?.length || 0;
-  const totalCount = window.appState.totalCount || 0;;
+  const totalLoaded = binder.papers?.length || 0;
+  const totalCount = window.appState.totalCount || 0;
+  const container = this.elements.researchChatContainer;
 
-  // Find or create pagination info element
-  let infoElement = document.querySelector(".pagination-info");
-  if (!infoElement) {
+  // Find or create pagination info element (in this view's own container)
+  let infoElement = container ? container.querySelector(".pagination-info") : null;
+  if (!infoElement && container) {
     infoElement = document.createElement("div");
     infoElement.className = "pagination-info";
-    if (this.elements.researchChatContainer) {
-      this.elements.researchChatContainer.appendChild(infoElement);
-    }
+    container.appendChild(infoElement);
   }
 
   if (infoElement) {
@@ -672,20 +707,10 @@ DOMManager.prototype.updatePaginationInfo = function() {
     `;
   }
 
-  // Show or hide load more button based on nextCursor and loading state
-  // Keep button visible as long as there are more papers to load
+  // Show or hide load more button based on nextCursor and loading state.
+  // The button's click handler is attached once in core.js.
   if (this.elements.loadMoreContainer) {
-    const hasMore = window.appState.nextCursor && !window.appState.isLoadingMore;
-
-    if (hasMore) {
-      this.elements.loadMoreContainer.style.display = "flex";
-      // Ensure button has click handler
-      const loadBtn = document.getElementById("loadMoreBtn");
-      if (loadBtn && !loadBtn.onclick) {
-        loadBtn.onclick = () => this.loadMorePapers();
-      }
-    } else if (window.appState.isLoadingMore) {
-      // Keep button visible during loading
+    if (window.appState.nextCursor || window.appState.isLoadingMore) {
       this.elements.loadMoreContainer.style.display = "flex";
     } else {
       // Only hide when we know there are no more papers AND not loading

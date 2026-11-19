@@ -80,6 +80,33 @@ QA_ALLOW_OCR = env.bool("QA_ALLOW_OCR", default=False)
 # value on a 512 MB instance; raise it on hosts with more RAM for speed.
 QA_CHUNK_WORKERS = max(1, env.int("QA_CHUNK_WORKERS", default=1))
 
+# Guest Mode (Research_AI_Assistant/guest_auth.py, guest_quota.py,
+# guest_ip.py, views_guest.py). Off unless GUEST_MODE_ENABLED=True. Limits are
+# enforced on the server per guest session.
+# Keep QA_ALLOW_OCR off while guests are enabled: OCR is process-wide and
+# can't safely be switched off for guest requests only.
+GUEST_MODE_ENABLED = env.bool("GUEST_MODE_ENABLED", default=False)
+GUEST_SESSION_HOURS = env.int("GUEST_SESSION_HOURS", default=24)
+GUEST_SEARCH_LIMIT = env.int("GUEST_SEARCH_LIMIT", default=3)
+GUEST_SUMMARY_LIMIT = env.int("GUEST_SUMMARY_LIMIT", default=3)
+GUEST_QUESTION_LIMIT = env.int("GUEST_QUESTION_LIMIT", default=5)
+# Papers per guest summary request (signed-in users keep MAX_SUMMARY_PAPERS).
+GUEST_MAX_SUMMARY_PAPERS = env.int("GUEST_MAX_SUMMARY_PAPERS", default=10)
+GUEST_SESSIONS_PER_IP_PER_DAY = env.int("GUEST_SESSIONS_PER_IP_PER_DAY", default=3)
+# Daily budget for ALL guests, counted in WORST-CASE upstream model attempts,
+# reserved before each AI request and kept unless the request was rejected
+# before any AI call (guest_quota.ai_attempt_weight): with the defaults one
+# guest summary reserves 2 x OPENROUTER_MAX_MODELS_PER_REQUEST (10) = 20 and
+# one question OPENROUTER_QA_MAX_MODELS (4). 300 is deliberately strict;
+# tune it to the provider budget before enabling guests.
+GUEST_DAILY_AI_LIMIT = env.int("GUEST_DAILY_AI_LIMIT", default=300)
+# Proxies whose X-Forwarded-For entries are trusted for guest per-IP limits
+# (IP addresses and/or CIDR ranges, comma-separated). Empty = trust no proxy:
+# REMOTE_ADDR only, any X-Forwarded-For ignored (see guest_ip.py). Behind a
+# reverse proxy/load balancer, set this to that proxy's addresses or every
+# guest shares the proxy's address and the per-IP cap is hit almost at once.
+GUEST_TRUSTED_PROXIES = env.list("GUEST_TRUSTED_PROXIES", default=[])
+
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 

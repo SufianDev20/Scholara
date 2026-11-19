@@ -1,4 +1,6 @@
 import { getCsrfToken } from './utils.js';
+import { clearGuestSession, exhaustedMessage, isGuestActive, remaining } from './guest.js';
+import { loadClerk } from './auth.js';
 
 window.csrfToken = getCsrfToken();
 
@@ -34,6 +36,11 @@ export class DOMManager {
       bindersContainer: document.getElementById("bindersContainer"),
       binderCount: document.getElementById("binderCount"),
 
+      // Recents (temporary research sessions, see recents.js)
+      recentsList: document.getElementById("recentsList"),
+      recentsCount: document.getElementById("recentsCount"),
+      recentsStorageNote: document.getElementById("recentsStorageNote"),
+
       // Research view elements
       researchView: document.getElementById("researchView"),
       researchQuery: document.getElementById("researchQuery"),
@@ -42,6 +49,7 @@ export class DOMManager {
       researchInput: document.getElementById("research-input"),
       researchSendBtn: document.getElementById("research-send-btn"),
       researchBackBtn: document.getElementById("researchBackBtn"),
+      researchHomeBtn: document.getElementById("researchHomeBtn"),
       saveToBinderBtn: document.getElementById("saveToBinderBtn"),
 
       // References panel elements
@@ -176,11 +184,23 @@ export class DOMManager {
       );
     }
 
+    // Back: previous in-app view (previous session or home), keeping all
+    // research progress. Go Home: straight to Ask Scholara; the session
+    // stays available in Recents. Both live in recents.js.
     if (elements.researchBackBtn) {
       elements.researchBackBtn.addEventListener(
         "click",
         function () {
-          this.hideResearchView();
+          this.goBackFromResearch();
+        }.bind(this),
+      );
+    }
+
+    if (elements.researchHomeBtn) {
+      elements.researchHomeBtn.addEventListener(
+        "click",
+        function () {
+          this.goHome();
         }.bind(this),
       );
     }
@@ -189,6 +209,26 @@ export class DOMManager {
       elements.saveToBinderBtn.addEventListener(
         "click",
         function () {
+          // Guest Mode: binders need an account. Only once Clerk confirms
+          // the visitor is NOT signed in do we send them to sign-in (the
+          // research stays in Recents, same tab); a signed-in user with a
+          // stale guest credential saves normally and the credential is
+          // discarded.
+          if (isGuestActive()) {
+            loadClerk()
+              .then((clerk) => Boolean(clerk && clerk.user))
+              .catch(() => false)
+              .then((signedIn) => {
+                if (signedIn) {
+                  clearGuestSession();
+                  this.saveToBinder();
+                  return;
+                }
+                this.flushResearchSessions();
+                window.location.href = "/sign-in/";
+              });
+            return;
+          }
           this.saveToBinder();
         }.bind(this),
       );
@@ -230,6 +270,18 @@ export class DOMManager {
       return;
     }
 
+    // Guest Mode: with no searches left, explain instead of opening an empty
+    // session and sending a request the server would refuse.
+    const guestNotice = document.getElementById("wsGuestNotice");
+    if (isGuestActive() && remaining("search") === 0) {
+      if (guestNotice) {
+        guestNotice.textContent = exhaustedMessage("search");
+        guestNotice.hidden = false;
+      }
+      return;
+    }
+    if (guestNotice) guestNotice.hidden = true;
+
     console.log("Elements available:", {
       queryInput: !!this.elements.queryInput,
       researchView: !!this.elements.researchView,
@@ -248,130 +300,31 @@ export class DOMManager {
   }
 
   // ==================== DOM MANIPULATION ====================
+  // Starts a new research session for `query` (recents.js keeps it as a
+  // temporary session -- never a Binder) and runs its search + summary.
   showResearchView(query) {
-    console.log("showResearchView called with query:", query);
-
-    // Hide hero and binders
-    if (this.elements.heroSection) {
-      console.log("Hiding hero section");
-      this.elements.heroSection.style.display = "none";
-    } else {
-      console.warn("Hero section element not found");
-    }
-
-    if (this.elements.bindersSection) {
-      console.log("Hiding binders section");
-      this.elements.bindersSection.style.display = "none";
-    } else {
-      console.warn("Binders section element not found");
-    }
-
-    // Show research view
-    if (this.elements.researchView) {
-      console.log("Showing research view");
-      this.elements.researchView.classList.add("show");
-    } else {
+    if (!query) return;
+    if (!this.elements.researchView) {
       console.warn("Research view element not found");
       return;
     }
 
-    // Set query top of bar
-    if (this.elements.researchQuery) {
-      console.log("Setting research query text:", query);
-      this.elements.researchQuery.textContent = query;
-    } else {
-      console.warn("Research query element not found");
-    }
-
-    // Hide save button only till first AI response appears
-    if (this.elements.saveToBinderBtn) {
-      console.log("Hiding save button initially");
-      this.elements.saveToBinderBtn.style.display = "none";
-    } else {
-      console.warn("Save button element not found");
-    }
-
-    // Initialize references panel to be visible with empty state
-    if (this.elements.referencesPanel) {
-      console.log("Initializing references panel");
-      this.elements.referencesPanel.style.display = "flex";
-      if (this.elements.referencesList) {
-        this.elements.referencesList.innerHTML =
-          '<div class="references-empty">No papers retrieved yet. Research results will appear here.</div>';
-      }
-    } else {
-      console.warn("References panel element not found");
-    }
-
-    // Clear chat
-    if (this.elements.researchChatContainer) {
-      console.log("Clearing research chat container");
-      this.elements.researchChatContainer.innerHTML = "";
-    } else {
-      console.warn("Research chat container element not found");
-      return;
-    }
-
-    // Add user message
-    if (query) {
-      console.log("Adding user message to chat:", query);
-      this.addMessage(query, true, this.elements.researchChatContainer);
-    } else {
-      console.warn("No query provided, skipping user message");
-    }
-
-    window.appState.isResearchView = true;
-
-    // Create temporary binder
-    if (query) {
-      console.log("Creating temporary binder with query:", query);
-      window.appState.currentResearchBinder = {
-        id: "temp-" + Date.now(),
-        name: query.length > 35 ? query.substring(0, 32) + "..." : query,
-        color: "#" + Math.floor(Math.random() * 16777215).toString(16),
-        messages: [{ role: "user", content: query }],
-        papers: [],
-      };
-      console.log(
-        "Temporary binder created:",
-        window.appState.currentResearchBinder,
-      );
-    } else {
-      console.warn("No query provided, skipping binder creation");
-    }
-
+    let session = null;
     try {
-      console.log("Calling generateResearchResponse");
+      session = this.startResearchSession(query);
       this.generateResearchResponse();
     } catch (error) {
       console.error("Error in showResearchView:", error);
       alert("Failed to start research. Please try again.");
-      // Reset state on error
-      window.appState.isResearchView = false;
-      window.appState.currentResearchBinder = null;
+      if (session) session.pending.search = false;
     }
   }
 
+  // Leaves the research view for the Ask Scholara home view. Kept under its
+  // original name because Save to Binder (paper.js) calls it. The session is
+  // no longer discarded: it stays in Recents.
   hideResearchView() {
-    // Hide research view
-    if (this.elements.researchView) {
-      this.elements.researchView.classList.remove("show");
-    }
-
-    // Show hero and binders
-    if (this.elements.heroSection)
-      this.elements.heroSection.style.display = "flex";
-    if (this.elements.bindersSection)
-      this.elements.bindersSection.style.display = "block";
-
-    this.renderBinders();
-
-    window.appState.isResearchView = false;
-    window.appState.currentResearchBinder = null;
-
-    if (this.elements.researchInput) {
-      this.elements.researchInput.value = "";
-    }
+    this.goHome();
   }
 
   addMessage(content, isUser = false, container) {

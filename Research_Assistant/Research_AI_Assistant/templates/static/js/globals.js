@@ -5,6 +5,7 @@ import './search.js';
 import './binders.js';
 import './research.js';
 import './paper.js';
+import './recents.js';
 
 // core.js (imported above via DOMManager) already sets window.csrfToken.
 
@@ -70,6 +71,10 @@ function init() {
   // Initial render
   domManager.renderBinders();
   domManager.setupFilterListeners();
+  // Restores Recents from this tab's sessionStorage and, if the URL/history
+  // entry points at a research session (refresh, or Back from Paper
+  // Analysis), reopens it from cache without any request.
+  domManager.initResearchSessions();
 
   // Expose domManager to global scope AFTER initialization. Binder
   // card actions (open/delete/rename/recolor) are wired by delegated

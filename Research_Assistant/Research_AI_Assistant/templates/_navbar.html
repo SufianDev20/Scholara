@@ -25,6 +25,13 @@
 
         <!-- Account menu -->
         <div class="profile-section">
+          <!-- Guest Mode allowance (js/guest-ui.js); hidden unless a guest
+               session is active. Links to sign-in for full access. -->
+          <a id="guestChip" class="guest-chip" href="/sign-in/" hidden>
+            <span class="guest-chip__label">Guest</span>
+            <span id="guestChipCounts" class="guest-chip__counts"></span>
+            <span class="guest-chip__cta">Sign in</span>
+          </a>
           <button id="themeToggle" class="theme-toggle" type="button"
                   aria-label="Switch to dark mode" title="Switch to dark mode">
             <svg class="theme-toggle__moon" viewBox="0 0 20 20" width="18" height="18"

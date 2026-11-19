@@ -41,7 +41,10 @@
 
     <div class="an-shell" id="anShell" hidden>
       <header class="an-topbar">
-        <a class="an-back" href="{% url 'research_ai_assistant:frontend' %}">
+        <!-- analysis.js points this at the originating research session
+             (workspace #research=<id>) and prefers browser Back when the
+             workspace is the previous page, so it restores from cache. -->
+        <a class="an-back" id="anBackLink" href="{% url 'research_ai_assistant:frontend' %}">
           {% include "landing/_icon.html" with name="arrow-right" cls="an-back__ico" %}
           <span>Back to research</span>
         </a>

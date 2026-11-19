@@ -9,6 +9,7 @@
 // module has to render something reasonable either way, without ever
 // inventing a name, email, or a settings link the app doesn't have.
 import { loadClerk, signOut } from "./auth.js";
+import { formatExpiry, getGuestSession } from "./guest.js";
 import { createLogger } from "./logger.js";
 
 const log = createLogger("profile");
@@ -63,7 +64,9 @@ function renderSignedOut() {
   const { avatar, name, role, manageItem, performanceItem, signOutItem, signInItem } = els();
   if (avatar) avatar.textContent = "S";
   if (name) name.textContent = "Guest researcher";
-  if (role) role.textContent = "Not signed in";
+  const guest = getGuestSession();
+  const until = guest ? formatExpiry(guest.expires_at) : "";
+  if (role) role.textContent = guest ? (until ? `Guest access until ${until}` : "Guest access") : "Not signed in";
   if (manageItem) manageItem.hidden = true;
   if (performanceItem) performanceItem.hidden = true;
   if (signOutItem) signOutItem.hidden = true;

@@ -8,9 +8,17 @@
         <!-- Research header -->
         <header class="research-top-bar">
           <div class="research-top-left">
-            <button id="researchBackBtn" class="research-back-btn" type="button" aria-label="Back to workspace" title="Back to workspace">
-              <i class="fa-solid fa-arrow-left" aria-hidden="true"></i>
-            </button>
+            <!-- Back: previous view (an earlier research session or home),
+                 keeping all progress. Go Home: straight to Ask Scholara; this
+                 session stays in Recents. Wired in js/recents.js via core.js. -->
+            <div class="research-nav" role="group" aria-label="Research navigation">
+              <button id="researchBackBtn" class="research-back-btn" type="button" aria-label="Back to previous view" title="Back to previous view">
+                <i class="fa-solid fa-arrow-left" aria-hidden="true"></i>
+              </button>
+              <button id="researchHomeBtn" class="research-back-btn research-home-btn" type="button" aria-label="Go home to Ask Scholara (this research stays in Recents)" title="Go home — this research stays in Recents">
+                <i class="fa-solid fa-house" aria-hidden="true"></i>
+              </button>
+            </div>
             <div class="research-heading">
               <p class="research-kicker">
                 <i class="fa-solid fa-feather-pointed" aria-hidden="true"></i>

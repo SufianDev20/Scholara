@@ -8,6 +8,15 @@
             <span>Ask Scholara</span>
           </div>
 
+          <!-- Guest Mode: friendly limit messages (core.js / guest-ui.js) -->
+          <p id="wsGuestNotice" class="ws-guest-notice" role="status" hidden></p>
+          <!-- Guest Mode allowance on narrow screens, where the navbar chip is
+               hidden to keep the account menu on screen (guest-ui.js). -->
+          <p id="wsGuestAllowance" class="ws-guest-allowance" hidden>
+            <span id="wsGuestAllowanceText"></span>
+            <a href="/sign-in/">Sign in</a>
+          </p>
+
           <!-- Main Search Container -->
           <div class="search-card" id="wsSearchCard">
             <div class="search-input-section">

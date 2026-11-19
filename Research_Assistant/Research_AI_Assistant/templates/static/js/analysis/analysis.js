@@ -8,6 +8,7 @@
 
 import { fetchResearchPapers, requestPaperAnalysis, requestPaperAnalysisStream, isPublisherBlock } from "./analysis_api.js";
 import { getCsrfToken, escapeHtml, doiUrl } from "../utils.js";
+import { exhaustedMessage, isGuestActive, remaining as remainingAllowance } from "../guest.js";
 import { MAX_ANALYZABLE_PAPERS } from "../constants.js";
 
 const SESSION_KEY = "scholara:analysisSession";
@@ -522,6 +523,12 @@ async function runAnalysis(turn) {
     );
   }
 
+  // Guest Mode: no questions left -> explain, without a request the server
+  // would refuse. (Retry stays available: it works once signed in.)
+  if (isGuestActive() && remainingAllowance("question") === 0) {
+    return failTurn(turn, exhaustedMessage("question"), { retryable: true });
+  }
+
   const controller = new AbortController();
   state.analysisAbort = controller; // aborted on page unload only
   turn.status = "pending";
@@ -586,9 +593,11 @@ async function runAnalysis(turn) {
           renderSelectedPapers();
           resolve();
         },
-        onError(msg) {
+        onError(msg, code) {
           streamFailed = true;
-          reject(new Error(msg));
+          const err = new Error(msg);
+          err.code = code ?? null;
+          reject(err);
         },
       }).then(() => {
         if (!streamFailed) resolve();
@@ -644,10 +653,41 @@ async function ensurePapers() {
   }
 }
 
+// "Back to research" returns to the research session this page came from.
+// When the previous history entry is the workspace, browser Back is used so
+// it can come straight from the back/forward cache (or, after a reload,
+// restore from the workspace's Recents cache) -- never re-running the
+// search. Otherwise the link opens the workspace at #research=<id>, which
+// restores the same session from Recents if this tab still has it.
+function wireBackLink(session) {
+  const link = document.getElementById("anBackLink");
+  if (!link) return;
+  // Only a Recents handoff names a session to reopen; a Binder handoff keeps
+  // the plain workspace link it always had.
+  const recentsId = session && typeof session.recentsSessionId === "string" ? session.recentsSessionId : "";
+  if (recentsId) link.href = `${link.pathname}#research=${encodeURIComponent(recentsId)}`;
+
+  link.addEventListener("click", (e) => {
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    let fromWorkspace = false;
+    try {
+      const ref = document.referrer ? new URL(document.referrer) : null;
+      fromWorkspace = !!ref && ref.origin === location.origin && ref.pathname === link.pathname;
+    } catch {
+      fromWorkspace = false;
+    }
+    if (fromWorkspace && history.length > 1) {
+      e.preventDefault();
+      history.back();
+    }
+  });
+}
+
 async function init() {
   cacheElements();
 
   const session = loadSession();
+  wireBackLink(session);
   if (!session) return showRecovery();
   state.session = session;
 
@@ -665,8 +705,12 @@ async function init() {
   renderTranscript();
 
   // A question arriving from the workspace has no turn yet; a reload already
-  // has one and must not re-ask it.
-  if (session.question && !session.turns.length) {
+  // has one and must not re-ask it. A handoff from a Recents session can
+  // also carry that session's earlier turns, so it flags its new question
+  // with askOnOpen; the flag is cleared before the turn is saved, so a
+  // reload never re-asks it either.
+  if (session.question && (session.askOnOpen === true || !session.turns.length)) {
+    session.askOnOpen = false;
     const turn = makeTurn(session.question, state.selectedIds);
     appendTurn(turn);
     runAnalysis(turn);

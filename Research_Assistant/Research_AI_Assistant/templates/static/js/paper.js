@@ -17,6 +17,10 @@ DOMManager.prototype.markdownToHtml = function(text) {
       const code = p1.trim();
       return "\n\n" + hold(`<pre class="code-block"><code>${code}</code></pre>`) + "\n\n";
     })
+    // Paper boundaries are found on the source line, before the markdown
+    // rules below rewrite it (see PAPER_LINE), and marked with a token
+    // linesToBlocks turns into one card per paper.
+    .replace(PAPER_LINE, paperToken)
     .replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, src) => {
       const url = src.startsWith("http") || src.startsWith("/")
         ? src
@@ -46,21 +50,52 @@ DOMManager.prototype.markdownToHtml = function(text) {
 
 // Groups the converted lines into cards, and lines into block elements.
 //
-// Cards: the summary prompt emits one "Paper [N]: Title" block per paper
+// The summary is ONE combined text for all papers (POST /api/summarise/
+// returns {"summary": "..."}): one "Paper N: Title" block per paper
 // (followed by "Authors:", "Year:", "Source:", "DOI:" and "Summary:" lines)
-// and a closing "References:" list. Each "Paper [N]" starts an <article
-// class="summary-card"> -- number label, title, metadata, then the summary
-// below a divider; the references list gets its own card, and any other
-// text (an intro, a synthesis, a plain-text reply) goes into a note card.
-// Every path that renders a summary -- the first response, Load More, its
-// retry and binder restore -- goes through markdownToHtml, so all of them
-// get the same cards. The card number is the N the summary itself uses
-// for that paper (its own citation numbering), never a sort position.
+// and a closing "References:" list. Each paper block becomes its own
+// <article class="summary-card">, and all cards are siblings inside one
+// <div class="summary-card-list">:
+//
+//   div.summary-card-list
+//     article.summary-card[data-paper-number=1]  number, title, meta, summary
+//     article.summary-card[data-paper-number=2]  ...
+//     section.summary-card--references
+//
+// Any other text (an intro, a synthesis, a plain-text reply) goes into a
+// note card of its own. Every path that renders a summary -- the first
+// response, Load More, its retry, Recents restore and binder restore --
+// goes through markdownToHtml, so all of them get the same cards. The card
+// number is the N the summary itself uses for that paper (its own citation
+// numbering), never a sort position.
 //
 // Blocks inside a card: blank lines separate paragraphs, "• " / "1. "
 // lines become lists, "> " lines a blockquote. Text is only wrapped, never
 // rewritten.
-const PAPER_HEADING = /^(?:<h[2-4]>)?(?:<strong>)?Paper\s*<span class="cite">\[(\d+)\]<\/span>\s*[:.–-]?\s*(.*?)(?:<\/strong>)?(?:<\/h[2-4]>)?$/i;
+//
+// Paper boundaries (PAPER_LINE): the same headings the backend requires
+// before a summary reaches the browser -- prompt_builder._PAPER_BLOCK_RE,
+// "Paper N:" or "Paper [N]:" at the start of a line, one per paper
+// (require_all_papers rejects a reply missing any). Models also wrap that
+// heading in markdown ("**Paper 1:** Title", "## Paper 1: Title"), so those
+// wrappers are accepted too. The bracketed form keeps its older, optional
+// separator. Matching runs on the escaped source line, BEFORE the markdown
+// rules turn "[1]" into a citation chip or "**" into <strong>, so no
+// rewritten form can hide a boundary. (Previously only the bracketed form
+// was recognised after those rewrites; a summary written "Paper 1: ..."
+// matched nothing and every paper ran together inside one card.)
+const PAPER_LINE =
+  /^[ \t]*(?:#{1,6}[ \t]+)?(\*\*|__)?[ \t]*Paper[ \t]*(?:\[(\d+)\][ \t]*(?:\*\*|__)?[ \t]*[:.–-]?|(\d+)[ \t]*(?:\*\*|__)?[ \t]*:)[ \t]*(?:\*\*|__)?(.*)$/gim;
+const PAPER_TOKEN = /^@@PAPER:(\d+)@@\s?(.*)$/;
+
+function paperToken(match, lead, bracketed, plain, rest) {
+  let title = rest.trim();
+  // "**Paper 1: Title**": drop the bold marker left unpaired at the end.
+  if (lead && title.split(lead).length % 2 === 0 && title.endsWith(lead)) {
+    title = title.slice(0, -lead.length).trim();
+  }
+  return `@@PAPER:${bracketed || plain}@@ ${title}`;
+}
 const REFERENCES_HEADING = /^(?:<h[2-4]>)?(?:<strong>)?References:?(?:<\/strong>)?(?:<\/h[2-4]>)?$/i;
 const SUMMARY_FIELD = /^(?:<strong>)?(Authors?|Year|Source|DOI|Summary)(?::<\/strong>|<\/strong>:|:)\s*(.*)$/i;
 const EMPTY_FIELD_VALUE = /^(?:|n\/?a|none|unknown|not available|-)\.?$/i;
@@ -203,7 +238,7 @@ DOMManager.prototype.linesToBlocks = function(text) {
       close();
       return;
     }
-    if ((m = line.match(PAPER_HEADING))) {
+    if ((m = line.match(PAPER_TOKEN))) {
       const n = m[1];
       openCard(`<article class="summary-card" data-paper-number="${n}">`, "</article>");
       out.push(`<p class="summary-card__number">Paper ${n.padStart(2, "0")}</p>`);
@@ -263,7 +298,8 @@ DOMManager.prototype.linesToBlocks = function(text) {
   });
   closeCard();
 
-  return out.join("");
+  // One list container; the cards inside it are siblings, never nested.
+  return out.length ? `<div class="summary-card-list">${out.join("")}</div>` : "";
 };
 
 DOMManager.prototype.escapeHtml = function(unsafe) {

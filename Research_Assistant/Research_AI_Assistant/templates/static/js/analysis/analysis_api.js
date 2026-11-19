@@ -30,6 +30,7 @@ export async function requestPaperAnalysis({ paperIds, question, pdfUrls, paperM
     const detail = data?.error ?? (data?.details && JSON.stringify(data.details)) ?? `Analysis request failed (HTTP ${response.status}).`;
     const err = new Error(detail);
     err.status = response.status;
+    err.code = data?.code ?? null; // e.g. guest_quota_exhausted (Guest Mode)
     err.paperErrors = data?.paper_errors ?? null;
     throw err;
   }
@@ -71,7 +72,8 @@ export async function requestPaperAnalysisStream({
   if (!response.ok) {
     const data = await response.json().catch(() => null);
     const detail = data?.error ?? `Analysis request failed (HTTP ${response.status}).`;
-    onError?.(detail);
+    // Second argument: the server's code (e.g. a Guest Mode limit), if any.
+    onError?.(detail, data?.code ?? null);
     return;
   }
 
