@@ -1,4 +1,8 @@
       <div class="binders-section">
+        {% comment %} Recents sit inside .binders-section so every path that
+        hides/shows the board (core.js, binders.js openBinder) covers them too. {% endcomment %}
+        {% include "_recents.html" %}
+
         <div class="binders-header">
           <div class="binders-title">
             <h2>Your Research Binders</h2>

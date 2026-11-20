@@ -34,3 +34,64 @@
 .si-sub { color: var(--ink-body); margin: 0 0 20px; }
 #clerk-sign-in { display: flex; justify-content: center; }
 .si-error { color: #9b2c2c; margin-top: 16px; }
+
+/* Notice (e.g. guest session ended) */
+.si-notice {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(47, 125, 93, 0.08);
+  color: var(--forest);
+  font-size: 0.9rem;
+}
+
+/* Guest Mode */
+.si-guest { margin-top: 20px; }
+.si-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 0 0 16px;
+  color: var(--ink-body);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.si-divider::before,
+.si-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: rgba(28, 70, 51, 0.15);
+}
+.si-guest__btn {
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 16px;
+  border: 1px solid rgba(28, 70, 51, 0.3);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--forest);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+.si-guest__btn:hover:not(:disabled) {
+  background: rgba(47, 125, 93, 0.08);
+  border-color: var(--emerald);
+}
+.si-guest__btn:focus-visible {
+  outline: 2px solid var(--emerald);
+  outline-offset: 2px;
+}
+.si-guest__btn:disabled { opacity: 0.7; cursor: progress; }
+.si-guest__note {
+  margin: 10px 0 0;
+  color: var(--ink-body);
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+@media (prefers-reduced-motion: reduce) {
+  .si-guest__btn { transition: none; }
+}

@@ -1073,6 +1073,324 @@ body {
   padding-bottom: 0.5rem;
 }
 
+/* ===== GUEST MODE =====
+   Allowance chip in the navbar and limit notice under "Ask Scholara"
+   (js/guest-ui.js, core.js). Hidden unless a guest session is active. */
+.guest-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 2.25rem;
+  padding: 0.3rem 0.4rem 0.3rem 0.8rem;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  background: var(--paper-raised);
+  color: var(--ink-body);
+  font-size: 0.75rem;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: border-color 0.15s var(--ease), background-color 0.15s var(--ease);
+}
+
+.guest-chip[hidden] {
+  display: none;
+}
+
+.guest-chip:hover {
+  border-color: var(--emerald);
+}
+
+.guest-chip:focus-visible {
+  outline: 2px solid var(--emerald);
+  outline-offset: 2px;
+}
+
+.guest-chip__label {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.66rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--forest);
+}
+
+.guest-chip__counts {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.68rem;
+  color: var(--ink-meta);
+}
+
+.guest-chip__cta {
+  padding: 0.25rem 0.65rem;
+  border-radius: 999px;
+  background: var(--forest);
+  color: #f6f7f0;
+  font-weight: 500;
+}
+
+.ws-guest-notice {
+  max-width: 40rem;
+  margin: 0 auto 0.9rem;
+  padding: 0.6rem 0.9rem;
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--forest);
+  font-size: 0.88rem;
+  text-align: center;
+}
+
+.app-body[data-theme="dark"] .guest-chip__label,
+.app-body[data-theme="dark"] .ws-guest-notice {
+  color: #a9d4be;
+}
+
+.app-body[data-theme="dark"] .guest-chip__cta {
+  background: #2f7d5d;
+}
+
+/* Allowance line under "Ask Scholara": only on narrow screens, where it
+   replaces the navbar chip. */
+.ws-guest-allowance {
+  display: none;
+  margin: 0 auto 0.9rem;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.72rem;
+  color: var(--ink-meta);
+  text-align: center;
+}
+
+.ws-guest-allowance a {
+  margin-left: 0.4rem;
+  color: var(--forest);
+  font-weight: 500;
+}
+
+/* Medium screens: keep the chip to "Guest · Sign in"; the full counts stay
+   in its accessible label and tooltip. */
+@media (max-width: 900px) {
+  .guest-chip__counts {
+    display: none;
+  }
+}
+
+/* Narrow screens: the navbar has no room for the chip (it would push the
+   account menu off-screen), so the allowance line under the search shows. */
+@media (max-width: 640px) {
+  .guest-chip {
+    display: none;
+  }
+
+  .ws-guest-allowance:not([hidden]) {
+    display: block;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .guest-chip {
+    transition: none;
+  }
+}
+
+/* ===== RECENTS =====
+   Temporary research sessions (js/recents.js), shown above the binders
+   board inside .binders-section, so they inherit its spacing and are
+   hidden with it whenever the research view is open. Rows, not sticky
+   notes: they're a quick "continue" list, visually quieter than binders. */
+.recents-section {
+  margin-bottom: 2.75rem;
+}
+
+.recents-header {
+  gap: 0.35rem;
+}
+
+.recents-hint {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--ink-meta);
+}
+
+.recents-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
+  gap: 0.75rem;
+}
+
+.recents-empty {
+  grid-column: 1 / -1;
+  padding: 1.5rem;
+  text-align: center;
+  color: var(--ink-meta);
+  font-size: 0.9rem;
+  border: 1px dashed var(--rule);
+  border-radius: 12px;
+  background: var(--panel);
+}
+
+.recent-item {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  background-color: var(--paper-raised);
+  border: 1px solid var(--rule);
+  border-radius: 10px;
+  box-shadow: 0 1px 2px rgba(18, 33, 25, 0.05);
+  transition: border-color 0.15s var(--ease), box-shadow 0.15s var(--ease);
+}
+
+.recent-item:hover,
+.recent-item:focus-within {
+  border-color: var(--emerald);
+  box-shadow: 0 6px 16px rgba(18, 33, 25, 0.1);
+}
+
+.recent-item__open {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.85rem 0.5rem 0.85rem 1rem;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 10px;
+}
+
+.recent-item__open:focus-visible,
+.recent-item__remove:focus-visible {
+  outline: 2px solid var(--emerald);
+  outline-offset: 2px;
+}
+
+.recent-item__icon {
+  flex-shrink: 0;
+  width: 2.1rem;
+  height: 2.1rem;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--forest);
+  font-size: 0.85rem;
+}
+
+.recent-item__body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.recent-item__topic {
+  font-family: "Newsreader", Georgia, serif;
+  font-size: 1.05rem;
+  font-weight: 500;
+  color: var(--ink);
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-item__meta {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 0.7rem;
+  color: var(--ink-meta);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-item__status {
+  align-self: flex-start;
+  padding: 0.05rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 500;
+  background: var(--panel);
+  color: var(--forest);
+}
+
+.recent-item__status--error,
+.recent-item__status--interrupted {
+  background: rgba(180, 83, 9, 0.1);
+  color: #9a4a0b;
+}
+
+.recent-item__action {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: var(--forest);
+}
+
+.recent-item__action i {
+  font-size: 0.72rem;
+  transition: transform 0.15s var(--ease);
+}
+
+.recent-item__open:hover .recent-item__action i {
+  transform: translateX(2px);
+}
+
+.recent-item__remove {
+  flex-shrink: 0;
+  width: 2.4rem;
+  border: none;
+  border-left: 1px solid var(--rule);
+  border-radius: 0 10px 10px 0;
+  background: transparent;
+  color: var(--ink-meta);
+  cursor: pointer;
+}
+
+.recent-item__remove:hover {
+  color: var(--ink);
+  background: var(--panel);
+}
+
+.recents-storage-note {
+  margin: 0.75rem 0 0;
+  font-size: 0.78rem;
+  color: var(--ink-meta);
+}
+
+.app-body[data-theme="dark"] .recent-item__status--error,
+.app-body[data-theme="dark"] .recent-item__status--interrupted {
+  background: rgba(251, 191, 36, 0.12);
+  color: #fcd34d;
+}
+
+.app-body[data-theme="dark"] .recent-item__icon,
+.app-body[data-theme="dark"] .recent-item__action {
+  color: #a9d4be;
+}
+
+@media (max-width: 480px) {
+  .recent-item__action span {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .recent-item,
+  .recent-item__action i {
+    transition: none;
+  }
+}
+
 .binders-empty {
   grid-column: 1 / -1;
   padding: 2.5rem 1.5rem;

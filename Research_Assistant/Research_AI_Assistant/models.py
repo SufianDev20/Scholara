@@ -302,3 +302,70 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self):
         return self.clerk_id
+
+
+# ---------------------------------------------------------------------------
+# Guest Mode (see guest_auth.py / guest_quota.py / views_guest.py).
+# Guests are never Users: they hold a signed, expiring token that maps to one
+# GuestAllowance row, whose counters are the server-side source of truth.
+# ---------------------------------------------------------------------------
+
+
+class GuestAllowance(models.Model):
+    """One guest session: its expiry and how much of each quota it has used.
+
+    Counters only move through guest_quota.reserve()/release(), which use a
+    single conditional UPDATE so concurrent requests can't exceed a limit.
+    """
+
+    guest_id = models.CharField(max_length=64, unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(db_index=True)
+    # HMAC of the client IP (never the raw address): enough to cap how many
+    # guest sessions one network can start per day.
+    issued_ip_hash = models.CharField(max_length=64, blank=True, default="")
+    searches_used = models.PositiveIntegerField(default=0)
+    summaries_used = models.PositiveIntegerField(default=0)
+    questions_used = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["issued_ip_hash", "created_at"], name="guest_ip_created_idx")
+        ]
+
+    def __str__(self):
+        return f"guest-{self.guest_id}"
+
+
+class GuestIssuedPaper(models.Model):
+    """A paper the search endpoint returned to a guest, for a given query.
+
+    Guests may only summarise / ask about papers listed here, and the server
+    uses its own stored copy (not the client's) when building AI prompts.
+    """
+
+    allowance = models.ForeignKey(
+        GuestAllowance, on_delete=models.CASCADE, related_name="issued_papers"
+    )
+    openalex_id = models.CharField(max_length=100)
+    query = models.CharField(max_length=500)
+    paper = models.JSONField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["allowance", "openalex_id", "query"],
+                name="uniq_guest_issued_paper",
+            )
+        ]
+
+
+class GuestDailyUsage(models.Model):
+    """Total guest AI calls per day, capped by settings.GUEST_DAILY_AI_LIMIT."""
+
+    day = models.DateField(unique=True)
+    ai_calls = models.PositiveIntegerField(default=0)
+
+    def __str__(self):
+        return f"{self.day}: {self.ai_calls}"

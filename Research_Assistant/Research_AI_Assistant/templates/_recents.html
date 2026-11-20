@@ -1,0 +1,20 @@
+        <!-- RECENTS: temporary research sessions for this browser tab.
+             Populated by js/recents.js. Separate from Binders: nothing here
+             is saved to a binder unless the user uses Save to Binder. -->
+        <section class="recents-section" aria-labelledby="recentsTitle">
+          <div class="binders-header recents-header">
+            <div class="binders-title">
+              <h2 id="recentsTitle">Recents</h2>
+              <div id="recentsCount" class="binder-count">0 sessions</div>
+            </div>
+            <p class="recents-hint">
+              Temporary, for this tab only. Reopen a topic to continue where you
+              left off, or save it to a binder to keep it.
+            </p>
+          </div>
+
+          <ul id="recentsList" class="recents-list" aria-labelledby="recentsTitle">
+            <!-- Populated by JS -->
+          </ul>
+          <p id="recentsStorageNote" class="recents-storage-note" role="status" hidden></p>
+        </section>

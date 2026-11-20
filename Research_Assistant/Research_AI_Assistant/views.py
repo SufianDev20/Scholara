@@ -54,6 +54,15 @@ from .services.qa_llm import (
 from .serializers import QARequestSerializer
 from .throttles import GenerateTitle, MultiPaperQAThrottle, SearchRateThrottle
 
+# Guest Mode: only search, summarise and multi_paper_qa accept guest tokens.
+# GuestAuthentication returns None for non-guest requests, so Clerk runs as
+# before; every other view keeps the Clerk-only default from settings.
+from .authentication import ClerkAuthentication
+from .guest_auth import GuestAuthentication
+from .guest_quota import guest_quota, is_guest
+
+GUEST_OR_CLERK = [GuestAuthentication, ClerkAuthentication]
+
 logger = logging.getLogger(__name__)
 
 openalex_service = OpenAlexService()
@@ -120,7 +129,9 @@ def api_root(request):
 
 
 @api_view(["GET"])
+@authentication_classes(GUEST_OR_CLERK)
 @throttle_classes([SearchRateThrottle])
+@guest_quota("search")
 @handle_service_errors()
 def search(request):
     """
@@ -253,15 +264,17 @@ def search(request):
             local = local_corpus_service.search(query, per_page)
             if LocalCorpusService.is_sufficient(local):
                 papers = local["papers"]
-                try:
-                    QueryLog.objects.create(
-                        query_text=query,
-                        ranking_mode=mode,
-                        result_count=len(papers),
-                        owner=request.user,
-                    )
-                except Exception:
-                    logger.warning("Failed to write QueryLog entry.", exc_info=True)
+                # Guests aren't Users (and RLS needs an owner): not logged.
+                if not is_guest(request):
+                    try:
+                        QueryLog.objects.create(
+                            query_text=query,
+                            ranking_mode=mode,
+                            result_count=len(papers),
+                            owner=request.user,
+                        )
+                    except Exception:
+                        logger.warning("Failed to write QueryLog entry.", exc_info=True)
                 return JsonResponse(
                     {
                         "papers": papers,
@@ -305,16 +318,17 @@ def search(request):
     # Extract structured metadata from raw works
     papers = [ExtractionService.extract_metadata(work) for work in raw_results]
 
-    # Log query — non-blocking
-    try:
-        QueryLog.objects.create(
-            query_text=query,
-            ranking_mode=mode,
-            result_count=len(papers),
-            owner=request.user,
-        )
-    except Exception:
-        logger.warning("Failed to write QueryLog entry.", exc_info=True)
+    # Log query — non-blocking. Guests aren't Users (and RLS needs an owner).
+    if not is_guest(request):
+        try:
+            QueryLog.objects.create(
+                query_text=query,
+                ranking_mode=mode,
+                result_count=len(papers),
+                owner=request.user,
+            )
+        except Exception:
+            logger.warning("Failed to write QueryLog entry.", exc_info=True)
 
     message = None
     if next_cursor is None:
@@ -400,7 +414,18 @@ def generate_title(request):
 def clerk_context():
     """Template context for pages that need the Clerk publishable key (it is
     public by design; the secret key is never passed to templates)."""
-    return {"clerk_publishable_key": settings.CLERK_PUBLISHABLE_KEY}
+    return {
+        "clerk_publishable_key": settings.CLERK_PUBLISHABLE_KEY,
+        # Shows "Continue as guest" on the sign-in page only when enabled,
+        # with the real configured limits.
+        "guest_mode_enabled": settings.GUEST_MODE_ENABLED,
+        "guest_limits": {
+            "searches": settings.GUEST_SEARCH_LIMIT,
+            "summaries": settings.GUEST_SUMMARY_LIMIT,
+            "questions": settings.GUEST_QUESTION_LIMIT,
+            "hours": settings.GUEST_SESSION_HOURS,
+        },
+    }
 
 
 def landing(request):
@@ -442,7 +467,9 @@ def analysis(request):
 
 
 @api_view(["POST"])
+@authentication_classes(GUEST_OR_CLERK)
 @throttle_classes([GenerateTitle])
+@guest_quota("summary")
 @handle_service_errors(include_error_code=True)
 def summarise(request):
     """
@@ -467,8 +494,16 @@ def summarise(request):
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON body"}, status=400)
 
-    query = data.get("query")
-    papers = data.get("papers")
+    if is_guest(request):
+        # Guests: only the server-checked query and the server's own copies
+        # of papers it returned to this guest (both set by @guest_quota,
+        # which rejects the request before this point if they don't check
+        # out). The client's query/papers are never used for a guest.
+        query = request.guest_vetted_query
+        papers = request.guest_vetted_papers
+    else:
+        query = data.get("query")
+        papers = data.get("papers")
 
     if not query or not isinstance(query, str):
         return JsonResponse({"error": "Missing or invalid 'query' field"}, status=400)
@@ -614,7 +649,9 @@ def search_authors(request):
 
 
 @api_view(["POST"])
+@authentication_classes(GUEST_OR_CLERK)
 @throttle_classes([MultiPaperQAThrottle])
+@guest_quota("question")
 def multi_paper_qa(request):
     """
     POST /api/multi-paper-qa/
@@ -719,7 +756,9 @@ def multi_paper_qa(request):
         )
 
     # The LLM sees short aliases + author labels, never OpenAlex URLs.
-    _, legend = build_paper_legend(validated.get("paper_meta"), papers_chunks.keys())
+    # Guests: paper names come from the server's copy (set by @guest_quota).
+    paper_meta = getattr(request, "guest_paper_meta", None) or validated.get("paper_meta")
+    _, legend = build_paper_legend(paper_meta, papers_chunks.keys())
 
     use_stream = request.query_params.get("stream") == "1"
 

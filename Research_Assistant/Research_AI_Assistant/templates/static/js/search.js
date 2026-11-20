@@ -1,5 +1,6 @@
 import { DOMManager } from './core.js';
 import { YEAR_MIN, YEAR_MAX } from './constants.js';
+import { guestErrorFrom } from './guest.js';
 
 // Extend DOMManager prototype with search-related methods
 DOMManager.prototype.updateYearLabel = function() {
@@ -298,11 +299,20 @@ DOMManager.prototype.retrieveFromBackend = async function(
     // issue — nothing to do with the query) from a query that legitimately
     // matched zero papers, which is a normal 200 response handled by the caller.
     let detail = null;
+    let guest = null;
     try {
       const errBody = await response.json();
       detail = errBody.error || errBody.detail || null;
+      guest = guestErrorFrom(errBody);
     } catch (_parseErr) {
       // Non-JSON error body; fall back to a status-based message below.
+    }
+    if (guest) {
+      // Guest Mode limit: a friendly message, not a service failure.
+      const guestErr = new Error(guest.message);
+      guestErr.guest = guest;
+      guestErr.status = response.status;
+      throw guestErr;
     }
     const err = new Error(
       detail

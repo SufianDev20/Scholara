@@ -33,6 +33,14 @@
     });
   }
 
+  // recents.js restores a session's mobile references toggle on Back/reopen
+  // (dispatched after the open handler below has collapsed it).
+  view.addEventListener("research:restore-ui", function (e) {
+    if (e.detail && typeof e.detail.referencesExpanded === "boolean") {
+      setExpanded(e.detail.referencesExpanded);
+    }
+  });
+
   var wasOpen = view.classList.contains("show");
   new MutationObserver(function () {
     var open = view.classList.contains("show");

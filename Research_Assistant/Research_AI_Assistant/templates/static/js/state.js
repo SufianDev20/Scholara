@@ -5,6 +5,7 @@ export class AppState {
     this.currentOpenBinderId = null;
     this.isResearchView = false;
     this.currentResearchBinder = null;
+    this.activeSessionId = null;        // Recents session shown in the research view (recents.js)
     this.isThinking = false;
     this.isGeneratingResponse = false;
     this.isLoadingMore = false;
